@@ -1,0 +1,9 @@
+# Changelog
+
+## 0.1.0 — First release
+
+- Use Google's official `agy acp` in Pi with an existing official `agy login`. No API keys or separate account management.
+- Discover the Gemini model families and thinking levels agy advertises to the account. Keep Pi's tools, transcript and compaction, including image blocks across restart.
+- Reuse a successful agent proof per agy version and recipe format, while checking for agy's fallback every session. `PI_AGY_TETHER_VERIFY=always` runs the marker each time.
+- Put the gateway-refused Pi preface verbatim at the start of the first real user prompt, never in the system instructions or marker turn.
+- Warm sessions reuse the live ACP conversation. Disk resume replays Pi's history; it is not an agy cache-resume guarantee.
