@@ -22,6 +22,8 @@
  * it would let Pi send content the vendor drops silently.
  */
 
+import { getBuiltinModels as getModels } from "@earendil-works/pi-ai/providers/all";
+
 export type AgyEffort = "low" | "medium" | "high" | "xhigh";
 
 /** agy's effort suffixes, in the order it lists them. */
@@ -227,12 +229,28 @@ export function thinkingLevelMap(
   return map;
 }
 
-/** Rows for `pi.registerProvider`; cost is zero because the subscription bills. */
+const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+function builtinGoogleCosts(): ReadonlyMap<string, any> {
+  try {
+    return new Map(getModels("google").map((model) => [model.id, model.cost]));
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Rows for `pi.registerProvider`. Known Gemini models carry Pi's built-in
+ * Google list rates so `calculateCost` reports notional API spend (matching
+ * subscription-tether convention); unlisted families stay at zero rather than
+ * guessing.
+ */
 export function agyModels(
   options: { images?: boolean } = {},
   families: readonly AgyFamily[] = catalog,
 ): any[] {
   const input: ("text" | "image")[] = options.images ? ["text", "image"] : ["text"];
+  const costs = builtinGoogleCosts();
   return families.map((family) => ({
     id: family.id,
     // The reader picks from this name, and the row still has to carry a number
@@ -240,7 +258,7 @@ export function agyModels(
     name: family.limitsReported ? family.name : `${family.name} (limits not reported)`,
     reasoning: family.effortLevels.length > 0,
     input,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: costs.get(family.id) ?? ZERO_COST,
     contextWindow: family.contextWindow,
     maxTokens: family.maxTokens,
     thinkingLevelMap: thinkingLevelMap(family),

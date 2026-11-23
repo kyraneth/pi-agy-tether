@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { getBuiltinModels as getModels } from "@earendil-works/pi-ai/providers/all";
 import {
   FALLBACK_FAMILIES,
   agyFamilies,
@@ -169,10 +170,20 @@ describe("catalog rows", () => {
     expect(orchestrator.thinkingLevelMap.high).toBeNull();
   });
 
-  it("prices nothing, because the subscription bills", () => {
+  it("carries built-in Google list costs for known models and zero for unlisted ones", () => {
+    const google = new Map(getModels("google").map((m) => [m.id, m.cost]));
+    setAgyCatalog(familiesFromSessionNew(sessionNew()));
     for (const row of agyModels()) {
-      expect(row.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+      const expected = google.get(row.id) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      expect(row.cost).toEqual(expected);
     }
+    expect(agyModels().find((r) => r.id === "gemini-4-argon")!.cost.input).toBeGreaterThan(0);
+    expect(agyModels().find((r) => r.id === "gemini-pro-orchestrator-neon")!.cost).toEqual({
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
   });
 });
 

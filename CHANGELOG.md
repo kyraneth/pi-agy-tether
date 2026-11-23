@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Report token usage from Antigravity in Pi. Where Gemini API list prices are available, Pi shows the equivalent API cost, not a charge to your subscription.
+- Keep temporary session and Antigravity files in Pi’s runtime directory, so sessions can work when the data directory is read-only.
+
 ## 0.1.0 — First release
 
 - Use Google's official `agy acp` in Pi with an existing official `agy login`. No API keys or separate account management.

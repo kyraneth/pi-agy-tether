@@ -29,8 +29,10 @@ Use `PI_AGY_TETHER_VERIFY=always pi` to run the marker check on every new ACP se
 
 ## Known limits
 
+- **Single-turn input limit.** In agy 1.5.12, agy itself was observed truncating input over 192,000 bytes in a single turn.
 - **Restarting Pi can lose cache reuse.** While Pi stays open, follow-up turns reuse the live ACP session. After a restart, Pi restores the conversation, but agy receives the earlier assistant and tool turns as labeled text rather than native messages. That is not a warm cache resume. See [restart behavior](docs/restart-cache.md).
 - **Tools still incur latency inside agy.** Pi executes the tools, but each call and result travels through agy's MCP handling before generation continues. Tool-heavy turns can take longer than with a direct provider.
 - **One account.** The tether uses the official CLI's current login; it does not manage multiple accounts.
+- **Workspace write required.** The tether writes the workspace agent recipe where the official CLI looks it up; a read-only workspace cannot start a session.
 
 [Issues](https://github.com/kyraneth/pi-agy-tether/issues) · [Source and attribution](SOURCE.md) · [MIT License](LICENSE). Not affiliated with Google.

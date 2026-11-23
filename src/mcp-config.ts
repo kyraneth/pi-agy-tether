@@ -11,7 +11,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sessionDir } from "./data-dir.js";
+import { existingSessionDir, sessionDir } from "./data-dir.js";
 import type { McpServerEntry } from "./agent-recipe.js";
 
 export interface ToolDefinition {
@@ -62,9 +62,11 @@ export function sessionMcpServer(input: {
 }
 
 export function removeSessionFiles(sessionId: string): void {
+  const dir = existingSessionDir(sessionId);
+  if (!dir) return;
   try {
-    rmSync(sessionDir(sessionId), { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
   } catch {
-    /* leftover staging is inert; the next spawn rewrites it */
+    /* leftover staging is inert; the next spawn uses a fresh directory */
   }
 }

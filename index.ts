@@ -148,6 +148,7 @@ export default async function (pi: ExtensionAPI) {
     pi.on("session_tree", retire);
     pi.on("session_shutdown", async (event: { type: string }) => {
       await retire(event);
+      await killAllProcesses();
       await stopHandoffBroker();
     });
   } catch (err) {

@@ -1,10 +1,10 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { recipePath } from "../src/agent-recipe.js";
+import { proofKey, recipePath } from "../src/agent-recipe.js";
 import { CliProcess } from "../src/cli-process.js";
 import { spawnAgy } from "../src/process-manager.js";
 import type { PromptBlock } from "../src/pi-context.js";
@@ -127,6 +127,38 @@ describe("versioned agent proof over ACP", () => {
     outcome = "ok";
     await open();
     expect(prompts.at(-1)).toEqual(markerPrompt);
+  });
+
+  it("opens and runs when the data home is read-only with no saved proof", async () => {
+    const roHome = mkdtempSync(join(tmpdir(), "pat-ro-home-"));
+    chmodSync(roHome, 0o500);
+    vi.stubEnv("PI_AGY_TETHER_HOME", roHome);
+    try {
+      const cli = await open();
+      expect(prompts).toEqual([markerPrompt]);
+      await send(cli);
+      await cli.retire();
+      expect(readdirSync(roHome)).toEqual([]);
+    } finally {
+      chmodSync(roHome, 0o700);
+      rmSync(roHome, { recursive: true, force: true });
+    }
+  });
+
+  it("skips the marker when a read-only data home already holds the proof", async () => {
+    const roHome = mkdtempSync(join(tmpdir(), "pat-ro-home-"));
+    const key = proofKey(version);
+    expect(key).toBeDefined();
+    writeFileSync(join(roHome, `agent-proof-${key}`), "");
+    chmodSync(roHome, 0o500);
+    vi.stubEnv("PI_AGY_TETHER_HOME", roHome);
+    try {
+      await (await open()).retire();
+      expect(prompts).toEqual([]);
+    } finally {
+      chmodSync(roHome, 0o700);
+      rmSync(roHome, { recursive: true, force: true });
+    }
   });
 
   it("moves refused lines verbatim to the first real prompt, with or without a marker", async () => {

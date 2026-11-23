@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { MCP_SERVER_NAME, removeSessionFiles, sessionMcpServer, writeToolSchema } from "../src/mcp-config.js";
 import { sessionDir } from "../src/data-dir.js";
+import {
+  cleanupRuntimeDir,
+  existingRuntimeDir,
+  resetRuntimeDirForTests,
+  runtimeDir,
+} from "../src/runtime-dir.js";
 
 const tools = [
   { name: "read", description: "Read file contents", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
@@ -21,6 +28,12 @@ describe("writeToolSchema", () => {
     writeToolSchema("sess-b", [tools[0]]);
     expect(JSON.parse(readFileSync(writeToolSchema("sess-a", tools), "utf8"))).toHaveLength(2);
     expect(JSON.parse(readFileSync(`${sessionDir("sess-b")}/tools.json`, "utf8"))).toHaveLength(1);
+  });
+
+  it("keeps path-traversal segments inside the runtime sessions directory", () => {
+    const path = writeToolSchema("../escape", tools);
+    expect(path.startsWith(join(runtimeDir(), "sessions"))).toBe(true);
+    expect(existsSync(path)).toBe(true);
   });
 });
 
@@ -46,5 +59,24 @@ describe("removeSessionFiles", () => {
     removeSessionFiles("sess-c");
     expect(existsSync(sessionDir("sess-c"))).toBe(false);
     expect(() => removeSessionFiles("sess-c")).not.toThrow();
+  });
+
+  it("never deletes outside its own session for dot-only ids", () => {
+    const keepPath = writeToolSchema("sess-keep", tools);
+    for (const id of [".", ".."]) {
+      const path = writeToolSchema(id, tools);
+      expect(path.startsWith(join(runtimeDir(), "sessions") + "/")).toBe(true);
+      removeSessionFiles(id);
+      expect(existsSync(keepPath)).toBe(true);
+      expect(existsSync(join(runtimeDir(), "sessions"))).toBe(true);
+    }
+  });
+
+  it("does not allocate a runtime directory for a session that was never staged", () => {
+    cleanupRuntimeDir();
+    resetRuntimeDirForTests();
+    expect(existingRuntimeDir()).toBeUndefined();
+    removeSessionFiles("sess-never-allocated");
+    expect(existingRuntimeDir()).toBeUndefined();
   });
 });

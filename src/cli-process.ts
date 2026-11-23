@@ -31,7 +31,7 @@ import {
   removeAgentRecipe,
   writeAgentRecipe,
 } from "./agent-recipe.js";
-import { sessionDir, tetherHome } from "./data-dir.js";
+import { agentProofPath, sessionDir } from "./data-dir.js";
 import {
   MCP_SERVER_NAME,
   removeSessionFiles,
@@ -98,7 +98,13 @@ const parked = new Map<string, { cli: CliProcess; cause: string }>();
 function checkFallback(logFile: string, proofPath: string | undefined): void {
   const problem = fallbackLogProblem(logFile);
   if (!problem) return;
-  if (proofPath) rmSync(proofPath, { force: true });
+  if (proofPath) {
+    try {
+      rmSync(proofPath, { force: true });
+    } catch {
+      /* disposable cache */
+    }
+  }
   throw new Error(problem);
 }
 
@@ -232,15 +238,6 @@ export class CliProcess {
     });
 
     const disposeOnFailure = async (error: unknown): Promise<never> => {
-      try {
-        const keep = `${join(sessionDir(sessionKey), "failed.log")}`;
-        writeFileSync(`${join(sessionDir(sessionKey), "failed.jsonl")}`,
-          JSON.stringify({ error: error instanceof Error ? error.message : String(error), stderr: getStderr() }, null, 1));
-        void keep;
-        copyFileSync(logFile, join(tetherHome(), "failed-agy.log"));
-      } catch {
-        /* best-effort diagnostic */
-      }
       client.dispose();
       forceKillProcess(proc);
       removeAgentRecipe(input.cwd, marker);
@@ -259,7 +256,7 @@ export class CliProcess {
       const reportedVersion = initialized?.agentInfo?.version;
       const agentVersion = typeof reportedVersion === "string" ? reportedVersion : "unknown";
       const key = proofKey(agentVersion);
-      const proofPath = key ? join(tetherHome(), `agent-proof-${key}`) : undefined;
+      const proofPath = key ? agentProofPath(key) : undefined;
 
       const opened = await client.request("session/new", {
         cwd: input.cwd,
@@ -298,9 +295,21 @@ export class CliProcess {
           if (problem) throw new Error(problem);
           if (preflight?.stopReason === "cancelled")
             throw new Error("agy cancelled the agent marker turn");
-          if (proofPath) writeFileSync(proofPath, "", { mode: 0o600 });
+          if (proofPath) {
+            try {
+              writeFileSync(proofPath, "", { mode: 0o600 });
+            } catch {
+              /* disposable cache: failing to persist the marker only costs a check next time */
+            }
+          }
         } catch (error) {
-          if (proofPath) rmSync(proofPath, { force: true });
+          if (proofPath) {
+            try {
+              rmSync(proofPath, { force: true });
+            } catch {
+              /* disposable cache */
+            }
+          }
           throw error;
         }
         if (applied.effort !== desired.effort) applied = await verifyPromptConfig(set, desired);

@@ -5,6 +5,7 @@ const model = {
   id: "gemini-4-argon",
   provider: "pi-agy-tether",
   api: "pi-agy-tether",
+  cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 0 },
 } as any;
 
 function fakeStream() {
@@ -119,5 +120,63 @@ describe("createEventBridge", () => {
     const output = bridge.getOutput();
     expect(output.stopReason).toBe("length");
     expect(output.usage).toMatchObject({ input: 1445, output: 10, reasoning: 4, totalTokens: 1455 });
+    expect(output.usage.cost.total).toBeCloseTo((1445 * 2 + 10 * 10) / 1e6, 10);
+  });
+
+  it("records per-step totalTokens from usage_update on toolUse turns and keeps the last step context on end_turn", () => {
+    const stream = fakeStream();
+    const bridge = createEventBridge(stream as any, model);
+    bridge.handleUpdate({ sessionUpdate: "usage_update", used: 0, size: 1_048_576 });
+    expect(bridge.started()).toBe(false);
+    bridge.handleUpdate({ sessionUpdate: "usage_update", used: 31_803, size: 1_048_576 });
+    // An initial/zero update never clobbers a positive step count.
+    bridge.handleUpdate({ sessionUpdate: "usage_update", used: 0, size: 1_048_576 });
+    bridge.pushToolCall({ id: "call-1", name: "read", arguments: { path: "seed.txt" } });
+    expect(bridge.getOutput().usage).toEqual({
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 31_803,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    });
+  });
+
+  const terminal = {
+    stopReason: "end_turn",
+    usage: {
+      inputTokens: 7061,
+      outputTokens: 247,
+      cachedReadTokens: 87891,
+      cachedWriteTokens: 0,
+      thoughtTokens: 134,
+      totalTokens: 95199,
+    },
+  };
+
+  it("prices cumulative agy usage once without billing thoughts twice", () => {
+    const bridge = createEventBridge(fakeStream() as any, model);
+    bridge.handleUpdate({ sessionUpdate: "usage_update", used: 31_882, size: 1_048_576 });
+    bridge.applyResult(terminal);
+    const usage = bridge.getOutput().usage;
+    expect(usage).toMatchObject({
+      input: 7061,
+      output: 247,
+      cacheRead: 87891,
+      cacheWrite: 0,
+      reasoning: 134,
+      totalTokens: 31_882,
+    });
+    expect(usage.cost.total).toBeCloseTo((7061 * 2 + 247 * 10 + 87891 * 0.1) / 1e6, 14);
+  });
+
+  it("does not invent a price for unlisted models", () => {
+    const bridge = createEventBridge(fakeStream() as any, {
+      ...model,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    bridge.applyResult(terminal);
+    expect(bridge.getOutput().usage.totalTokens).toBe(95_199);
+    expect(bridge.getOutput().usage.cost.total).toBe(0);
   });
 });

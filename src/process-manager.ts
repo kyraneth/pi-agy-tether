@@ -196,6 +196,13 @@ export function registerProcess(proc: ChildProcess): void {
   liveProcesses.add(proc);
   proc.once("exit", () => liveProcesses.delete(proc));
 }
-export function killAllProcesses(): void {
-  for (const proc of liveProcesses) forceKillProcess(proc);
+export async function killAllProcesses(): Promise<void> {
+  await Promise.all([...liveProcesses].map((proc) => {
+    if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) return;
+    // agy can still write its private state after accepting SIGTERM. Observe
+    // exit before allowing normal shutdown to remove the runtime directory.
+    const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+    forceKillProcess(proc);
+    return exited;
+  }));
 }

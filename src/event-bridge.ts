@@ -7,13 +7,14 @@
  * ACP `tool_call` updates for vendor tools never become Pi tool calls.
  */
 
-import type {
-  AssistantMessage,
-  AssistantMessageEventStream,
-  Model,
-  TextContent,
-  ThinkingContent,
-  ToolCall,
+import {
+  calculateCost,
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Model,
+  type TextContent,
+  type ThinkingContent,
+  type ToolCall,
 } from "@earendil-works/pi-ai";
 
 export const PROVIDER_ID = "pi-agy-tether";
@@ -68,13 +69,12 @@ export function acpUsage(u: AcpPromptResult["usage"]): {
   const input = finite(u?.inputTokens) ? u!.inputTokens! : 0;
   const completion = finite(u?.outputTokens) ? u!.outputTokens! : 0;
   const reasoning = finite(u?.thoughtTokens) ? u!.thoughtTokens! : 0;
-  const output = completion + reasoning;
-  const total = finite(u?.totalTokens) ? u!.totalTokens! : input + output;
-  // On measured agy 1.5.12 cache hits, the terminal's total reconciles as
-  // input + cache + its raw output counter. Keep the previous inclusive-input
-  // fallback when the terminal doesn't establish that split.
+  // When the terminal reconciles, its input excludes cache and its output
+  // already includes thoughts. Keep the old fallback for other payloads.
   const cache = cached + writes;
   const inputIsUncached = u?.totalTokens === input + cache + completion;
+  const output = inputIsUncached ? completion : completion + reasoning;
+  const total = finite(u?.totalTokens) ? u!.totalTokens! : input + output;
   return {
     input: inputIsUncached ? input : Math.max(0, input - cache),
     output,
@@ -106,6 +106,7 @@ export function createEventBridge(
   let started = false;
   let textBlock: { index: number; text: string } | undefined;
   let thinkingBlock: { index: number; text: string } | undefined;
+  let lastStepUsed: number | undefined;
 
   const output: AssistantMessage = {
     role: "assistant",
@@ -219,6 +220,17 @@ export function createEventBridge(
         if (update.content?.type === "text" && typeof update.content.text === "string")
           appendThinking(update.content.text);
         return;
+      case "usage_update":
+        // agy emits each inference step's total token count (`used`) before
+        // tool_call and before the prompt terminal. Record it so toolUse turns
+        // carry real per-step context tokens and the final assistant message
+        // reports the last step's context rather than the multi-step sum.
+        // The terminal alone supplies the cumulative priced token counters.
+        if (finite(update.used) && update.used > 0) {
+          lastStepUsed = update.used;
+          output.usage.totalTokens = update.used;
+        }
+        return;
       default:
         // user_message_chunk, tool_call, tool_call_update, plan,
         // available_commands_update, config_option_update, session_info_update:
@@ -256,7 +268,8 @@ export function createEventBridge(
       output.usage.cacheRead = usage.cacheRead;
       output.usage.cacheWrite = usage.cacheWrite;
       output.usage.reasoning = usage.reasoning;
-      output.usage.totalTokens = usage.totalTokens;
+      output.usage.totalTokens = lastStepUsed ?? usage.totalTokens;
+      if (model.cost) calculateCost(model, output.usage);
     }
     const mapped = mapStopReason(result.stopReason);
     // A handoff already claimed this episode: the turn continues in Pi.

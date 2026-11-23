@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { afterEach, describe, expect, it } from "vitest";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   APP_DATA_NAME,
   HOME_ENV,
+  agentProofPath,
   appDataDir,
   geminiDir,
   hostLoginPath,
@@ -12,6 +13,22 @@ import {
   sessionDir,
   tetherHome,
 } from "../src/data-dir.js";
+import { cleanupRuntimeDir, resetRuntimeDirForTests, runtimeDir } from "../src/runtime-dir.js";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  cleanupRuntimeDir();
+  resetRuntimeDirForTests();
+  for (const dir of tempDirs.splice(0)) {
+    try {
+      chmodSync(dir, 0o700);
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort test cleanup */
+    }
+  }
+});
 
 describe("tether home", () => {
   it("honours the override", () => {
@@ -21,6 +38,7 @@ describe("tether home", () => {
   it("falls back to the XDG data home", () => {
     const saved = process.env[HOME_ENV];
     const dataHome = mkdtempSync(join(tmpdir(), "pat-xdg-"));
+    tempDirs.push(dataHome);
     const savedData = process.env.XDG_DATA_HOME;
     process.env.XDG_DATA_HOME = dataHome;
     delete process.env[HOME_ENV];
@@ -32,13 +50,47 @@ describe("tether home", () => {
     }
   });
 
-  it("keeps a private gemini home instead of the official one", () => {
-    expect(geminiDir()).toBe(join(tetherHome(), "gemini"));
-    expect(appDataDir()).toBe(join(tetherHome(), "gemini", APP_DATA_NAME));
+  it("keeps vendor state inside the private runtime directory", () => {
+    expect(geminiDir()).toBe(join(runtimeDir(), "gemini"));
+    expect(appDataDir()).toBe(join(runtimeDir(), "gemini", APP_DATA_NAME));
+    expect(sessionDir("sess-1")).toBe(join(runtimeDir(), "sessions", "sess-1"));
+    expect(geminiDir().startsWith(tetherHome())).toBe(false);
+    expect(sessionDir("sess-1").startsWith(tetherHome())).toBe(false);
   });
 
-  it("stages each session under the tether home", () => {
-    expect(sessionDir("sess-1")).toBe(join(tetherHome(), "sessions", "sess-1"));
+  it("keeps the proof cache readable from a read-only home without moving session state back", () => {
+    const roHome = mkdtempSync(join(tmpdir(), "pat-rohome-"));
+    tempDirs.push(roHome);
+    const key = "testkey";
+    writeFileSync(join(roHome, `agent-proof-${key}`), "");
+    chmodSync(roHome, 0o500);
+    const saved = process.env[HOME_ENV];
+    process.env[HOME_ENV] = roHome;
+    try {
+      expect(agentProofPath(key)).toBe(join(roHome, `agent-proof-${key}`));
+      expect(sessionDir("sess-ro")).toBe(join(runtimeDir(), "sessions", "sess-ro"));
+      expect(geminiDir()).toBe(join(runtimeDir(), "gemini"));
+      expect(appDataDir()).toBe(join(runtimeDir(), "gemini", APP_DATA_NAME));
+    } finally {
+      process.env[HOME_ENV] = saved;
+    }
+  });
+
+  it("names the unwritable runtime directory when no runtime location exists", () => {
+    const roTmp = mkdtempSync(join(tmpdir(), "pat-notmp-"));
+    tempDirs.push(roTmp);
+    chmodSync(roTmp, 0o500);
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = roTmp;
+    resetRuntimeDirForTests();
+    try {
+      expect(() => sessionDir("sess-none")).toThrow(roTmp);
+      expect(() => geminiDir()).toThrow(roTmp);
+    } finally {
+      if (savedTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = savedTmp;
+      resetRuntimeDirForTests();
+    }
   });
 });
 
