@@ -18,7 +18,6 @@ import {
 import {
   piContext as normalizePiContext,
   historyHash,
-  replayPiMessages,
 } from "./pi-context.js";
 import {
   CliProcess,
@@ -30,6 +29,7 @@ import {
 import { createEventBridge, PROVIDER_ID } from "./event-bridge.js";
 import type { ToolDefinition } from "./mcp-config.js";
 import type { HandoffResult } from "./handoff-broker.js";
+import { TurnLimitError, type TurnPlan } from "./turn-budget.js";
 
 /** Extended stream options: Pi's SimpleStreamOptions plus host plumbing. */
 export type StreamViaAcpOptions = SimpleStreamOptions & {
@@ -295,10 +295,42 @@ export function streamViaAcp(
         return;
       }
       debug("opened", { sessionId: cli.sessionId, models: cli.offeredModels.length });
-      cli.sendPrompt(replayPiMessages(messages));
     }
 
     const live = cli;
+    let plan: TurnPlan | undefined;
+    if (mode !== "handoff") {
+      if (mode === "turn") {
+        try {
+          await live.ensureConfigured(options?.reasoning);
+        } catch (error) {
+          await live.retire(["config_readback"]);
+          throw error;
+        }
+      }
+      if (invalidated() || options?.signal?.aborted) {
+        await live.retire(["abort"]);
+        failPiRequest("Request aborted or invalidated by agy lifecycle", "aborted");
+        return;
+      }
+      try {
+        plan = live.planTurns(mode === "spawn" ? messages : delta, prepared.tools?.length ?? 0);
+      } catch (error) {
+        if (error instanceof TurnLimitError && mode === "turn" && piSessionId)
+          parkCliProcess(piSessionId, live, "turn_limit_exceeded");
+        else await live.retire(["turn_limit_exceeded"]);
+        throw error;
+      }
+      try {
+        for (const staged of plan.stagedTurns) {
+          await live.sendStagedPrompt(staged, options?.signal);
+          if (invalidated()) throw new Error("Staged context was invalidated by agy lifecycle");
+        }
+      } catch (error) {
+        await live.retire(["staged_turn_failed"]);
+        throw error;
+      }
+    }
     const bridge = createEventBridge(stream, model);
     let streamEnded = false;
     let finished = false;
@@ -419,33 +451,15 @@ export function streamViaAcp(
 
     live.attach(sink);
 
-    if (mode === "turn") {
+    if (plan) {
       try {
-        // Verify live model and effort on every new prompt.
-        await live.ensureConfigured(options?.reasoning);
+        options?.signal?.throwIfAborted();
+        live.sendPrompt(plan.finalTurn);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        failPiRequest(message);
-        await live.retire(["config_readback"]);
-        return;
-      }
-      if (invalidated() || options?.signal?.aborted) {
-        aborted = true;
-        await live.retire(["abort"]);
         finishEpisode();
-        failPiRequest("Request aborted", "aborted");
-        return;
+        await live.retire([plan.stagedTurns.length ? "staged_turn_failed" : "prompt_not_sent"]);
+        throw error;
       }
-      live.sendPrompt(
-        delta.length
-          ? replayPiMessages(delta)
-          : [
-              {
-                type: "text",
-                text: "Continue the existing conversation. Do not repeat completed tool actions.",
-              },
-            ],
-      );
     }
 
     if (options?.signal) {

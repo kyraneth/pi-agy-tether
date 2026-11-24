@@ -31,7 +31,7 @@ import {
   removeAgentRecipe,
   writeAgentRecipe,
 } from "./agent-recipe.js";
-import { agentProofPath, sessionDir } from "./data-dir.js";
+import { agentProofPath, appDataDir, sessionDir } from "./data-dir.js";
 import {
   MCP_SERVER_NAME,
   removeSessionFiles,
@@ -60,9 +60,30 @@ import {
   configureSession,
   desiredConfig,
   verifyPromptConfig,
-  type SessionConfig,
+  type ConfigOption,
 } from "./thinking-config.js";
 import type { PromptBlock } from "./pi-context.js";
+import { assertWithinTurnLimit, planTurns, type TurnAssembly } from "./turn-budget.js";
+
+function modelLabel(options: readonly ConfigOption[] | undefined): string {
+  const label = (id: string) => {
+    const config = options?.find(o => o.id === id);
+    return config?.options?.find(o => o.value === config.currentValue)?.name ?? config?.currentValue;
+  };
+  const model = label("model");
+  const effort = label("thought_level");
+  return model ? (effort ? `${model} (${effort})` : model) : "None";
+}
+
+function assemblyFor(path: string, fromLabel: string, toLabel: string, prefaceText?: string): TurnAssembly {
+  return { appDataDirPath: path, prefaceText, settingsChange: fromLabel === toLabel ? undefined : { fromLabel, toLabel } };
+}
+
+function requestPrompt(client: AcpClient, sessionId: string, blocks: PromptBlock[], assembly: TurnAssembly, version: string): Promise<any> {
+  assertWithinTurnLimit(blocks, assembly, version);
+  const prompt = assembly.prefaceText ? [{ type: "text", text: assembly.prefaceText }, ...blocks] : blocks;
+  return client.request("session/prompt", { sessionId, prompt });
+}
 
 /** What an attached episode receives. */
 export interface EpisodeSink {
@@ -127,6 +148,7 @@ export class CliProcess {
 
   private sink: EpisodeSink | undefined;
   private promptInFlight = false;
+  private stagedCapture: { text: string; fail: (message: string) => void } | undefined;
   private buffered: any[] = [];
   private handoffs: HandoffInvocation[] = [];
   private pending = new Map<string, HandoffInvocation>();
@@ -139,6 +161,9 @@ export class CliProcess {
     readonly input: OpenInput,
     private firstPromptPreface: string[],
     private readonly proofPath: string | undefined,
+    private readonly appDataDirPath: string,
+    private currentModelLabel: string,
+    private lastPromptLabel: string,
     init: {
       sessionKey: string;
       agentVersion: string;
@@ -278,18 +303,22 @@ export class CliProcess {
       const verify = process.env.PI_AGY_TETHER_VERIFY === "always"
         || !proofPath || !existsSync(proofPath);
       const desired = desiredConfig(input.modelId, input.thinkingLevel);
-      const set = async (configId: string, value: string) => (await client.request(
+      let options = opened?.configOptions;
+      const set = async (configId: string, value: string) => options = (await client.request(
         "session/set_config_option", { sessionId, configId, value },
       ))?.configOptions;
-      let applied = await configureSession(set, desired, opened?.configOptions, verify && input.oneShot === true);
+      const path = appDataDir();
+      let lastPromptLabel = "None";
+      let applied = await configureSession(set, desired, options, verify && input.oneShot === true);
 
       // `session/new` succeeds even when agy silently loads its stock agent.
       if (verify) {
         try {
-          const preflight = await client.request("session/prompt", {
-            sessionId,
-            prompt: [{ type: "text", text: "Reply with the tether session marker only." }],
-          });
+          const label = modelLabel(options);
+          const preflight = await requestPrompt(client, sessionId,
+            [{ type: "text", text: "Reply with the tether session marker only." }],
+            assemblyFor(path, lastPromptLabel, label), agentVersion);
+          lastPromptLabel = label;
           checkFallback(logFile, proofPath);
           const problem = gatewayRefusalProblem(preflightText) ?? markerProblem(preflightText, marker);
           if (problem) throw new Error(problem);
@@ -315,7 +344,7 @@ export class CliProcess {
         if (applied.effort !== desired.effort) applied = await verifyPromptConfig(set, desired);
       }
 
-      instance = new CliProcess(proc, client, input, recipe.preface, proofPath, {
+      instance = new CliProcess(proc, client, input, recipe.preface, proofPath, path, modelLabel(options), lastPromptLabel, {
         sessionKey,
         agentVersion,
         offeredModels,
@@ -366,11 +395,12 @@ export class CliProcess {
   }
 
   diagnostic(message: string): void {
-    this.sink?.onFatal(message);
+    this.fatal(message);
   }
 
   fatal(message: string): void {
-    this.sink?.onFatal(message);
+    if (this.stagedCapture) this.stagedCapture.fail(message);
+    else this.sink?.onFatal(message);
   }
 
   private handleExit(code: number | null): void {
@@ -394,6 +424,7 @@ export class CliProcess {
    * here is a safety net, not a normal path.
    */
   decidePermission(params: any): { outcome: "allowed" | "denied" } {
+    if (this.stagedCapture) return { outcome: "denied" };
     const toolCall = params?.toolCall;
     const directPrefix = `mcp_${MCP_SERVER_NAME}_`;
     // Eager calls have a qualified name, but no ServerName in their arguments.
@@ -429,6 +460,18 @@ export class CliProcess {
   }
 
   private routeUpdate(update: any): void {
+    const staged = this.stagedCapture;
+    if (staged) {
+      if (update?.sessionUpdate === "agent_message_chunk" && typeof update.content?.text === "string") {
+        staged.text += update.content.text;
+        const problem = gatewayRefusalProblem(staged.text);
+        if (problem) {
+          this.cancel();
+          staged.fail(problem);
+        }
+      }
+      return;
+    }
     if (this.sink) this.sink.onUpdate(update);
     else this.buffered.push({ type: "update", update });
   }
@@ -442,6 +485,10 @@ export class CliProcess {
 
   /** Broker callback: a Pi tool call is blocked and waiting for Pi. */
   onHandoffCall(invocation: HandoffInvocation): void {
+    if (this.stagedCapture) {
+      invocation.respond({ content: [{ type: "text", text: "Pi is staging context; tool not executed" }], isError: true });
+      return;
+    }
     this.pending.set(invocation.piCallId, invocation);
     if (this.sink) this.sink.onHandoffCall(invocation);
     else this.handoffs.push(invocation);
@@ -465,28 +512,59 @@ export class CliProcess {
   }
 
   /** Verify live model and effort before a new prompt; never trust a default. */
-  async ensureConfigured(thinkingLevel: string | undefined): Promise<SessionConfig> {
-    return verifyPromptConfig(async (configId, value) => (await this.client.request(
+  async ensureConfigured(thinkingLevel: string | undefined): Promise<void> {
+    let options: readonly ConfigOption[] | undefined;
+    await verifyPromptConfig(async (configId, value) => options = (await this.client.request(
       "session/set_config_option", { sessionId: this.sessionId, configId, value },
     ))?.configOptions, desiredConfig(this.modelId, thinkingLevel));
+    this.currentModelLabel = modelLabel(options);
   }
 
-  /** Send one prompt; results and updates route to the attached episode. */
-  sendPrompt(blocks: PromptBlock[]): void {
-    if (this.promptInFlight)
-      throw new Error("agy session already has a prompt in flight");
+  private nextAssembly(): TurnAssembly {
+    return assemblyFor(this.appDataDirPath, this.lastPromptLabel, this.currentModelLabel, this.firstPromptPreface.join("\n"));
+  }
+
+  planTurns(messages: any[], toolCount: number) {
+    return planTurns({ messages, toolCount, agentVersion: this.agentVersion, first: this.nextAssembly(), later: { appDataDirPath: this.appDataDirPath } });
+  }
+
+  private startPrompt(blocks: PromptBlock[]): Promise<AcpPromptResult> {
+    if (this.promptInFlight) throw new Error("agy session already has a prompt in flight");
+    checkFallback(this.logFile, this.proofPath);
+    const result = requestPrompt(this.client, this.sessionId, blocks, this.nextAssembly(), this.agentVersion);
     this.promptInFlight = true;
     this.turnActive = true;
-    const prompt = this.firstPromptPreface.length
-      ? [{ type: "text", text: this.firstPromptPreface.join("\n") }, ...blocks]
-      : blocks;
     this.firstPromptPreface = [];
-    void Promise.resolve()
-      .then(() => {
-        checkFallback(this.logFile, this.proofPath);
-        return this.client.request("session/prompt", { sessionId: this.sessionId, prompt })
-          .finally(() => checkFallback(this.logFile, this.proofPath));
-      })
+    this.lastPromptLabel = this.currentModelLabel;
+    return result.finally(() => checkFallback(this.logFile, this.proofPath));
+  }
+
+  /** A hidden context-only turn. Never buffer updates or allow a tool handoff. */
+  async sendStagedPrompt(blocks: PromptBlock[], signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (this.sink || this.promptInFlight || this.stagedCapture)
+      throw new Error("agy must be idle before staging context");
+    let fail!: (message: string) => void;
+    const failed = new Promise<never>((_, reject) => { fail = message => reject(new Error(message)); });
+    const abort = () => { this.cancel(); fail("Request aborted"); };
+    this.stagedCapture = { text: "", fail };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      const result = await Promise.race([failed, this.startPrompt(blocks)]);
+      signal?.throwIfAborted();
+      if (result.stopReason !== "end_turn")
+        throw new Error(`agy did not finish the staged context turn (${result.stopReason ?? "missing stop reason"})`);
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      this.stagedCapture = undefined;
+      this.promptInFlight = false;
+      this.turnActive = false;
+    }
+  }
+
+  /** Send the final prompt; results and updates route to the attached episode. */
+  sendPrompt(blocks: PromptBlock[]): void {
+    void this.startPrompt(blocks)
       .then((result) => {
         if (this.retired) return;
         this.routeResult(result ?? {});
