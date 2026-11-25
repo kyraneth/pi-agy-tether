@@ -21,6 +21,7 @@ import { rewriteOverflowMessage } from "./src/overflow.js";
 import { piContext } from "./src/pi-context.js";
 import type { ToolDefinition } from "./src/mcp-config.js";
 import { PROVIDER_ID } from "./src/event-bridge.js";
+import { rememberTransportNotice, RESULT_NOTICE_ENTRY, type ResultLossNotice } from "./src/degradations.js";
 
 process.on("exit", killAllProcesses);
 process.on("exit", () => void stopHandoffBroker());
@@ -42,19 +43,27 @@ async function ensureHandoffSocket(): Promise<string> {
 }
 
 /** Deliver load-time configuration notices where the user can see them. */
-function flushStartupNotices(ctx: unknown): void {
-  const c = ctx as
-    | { hasUI?: boolean; ui?: { notify?: (m: string, l: string) => void } }
-    | undefined;
-  for (const message of takeStartupNotices()) {
-    if (c?.hasUI && c.ui?.notify)
-      c.ui.notify(`pi-agy-tether: ${message}`, "warning");
-    else console.warn(`[pi-agy-tether] ${message}`);
-  }
+function notifyPi(ctx: { hasUI: boolean; ui: { notify: (message: string, type: "warning") => void } } | undefined, message: string): void {
+  if (ctx?.hasUI) ctx.ui.notify(`pi-agy-tether: ${message}`, "warning");
+  else console.warn(`[pi-agy-tether] ${message}`);
 }
 
 export default async function (pi: ExtensionAPI) {
-  pi.on("session_start", (_event: unknown, ctx: unknown) => flushStartupNotices(ctx));
+  let notify: (message: string) => void = (message) => notifyPi(undefined, message);
+  let recordResultNotice: ((notice: ResultLossNotice) => void) | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    notify = (message) => notifyPi(ctx, message);
+    const sessionId = ctx.sessionManager.getSessionId();
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type !== "custom" || entry.customType !== RESULT_NOTICE_ENTRY) continue;
+      const data = entry.data as ({ sessionId?: string; once?: string } | undefined);
+      if (data?.sessionId === sessionId && typeof data.once === "string") {
+        rememberTransportNotice(sessionId, data.once);
+      }
+    }
+    recordResultNotice = (notice) => pi.appendEntry(RESULT_NOTICE_ENTRY, { ...notice, sessionId });
+    for (const message of takeStartupNotices()) notify(message);
+  });
 
   try {
     const binary = validateCliPresence();
@@ -73,6 +82,8 @@ export default async function (pi: ExtensionAPI) {
     ) =>
       streamViaAcp(model, context, {
         ...options,
+        notify,
+        recordResultNotice,
         prepareMcp: async (effectiveContext) => {
           const toolDefs: ToolDefinition[] = piContext(effectiveContext).tools.map(
             (t: any) => ({
@@ -155,7 +166,7 @@ export default async function (pi: ExtensionAPI) {
     addStartupNotice(
       err instanceof Error ? err.message : String(err),
     );
-    flushStartupNotices(undefined);
+    for (const message of takeStartupNotices()) notify(message);
     console.error(`[pi-agy-tether] Failed to register provider:`, err);
   }
 }

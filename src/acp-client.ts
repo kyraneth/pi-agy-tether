@@ -8,6 +8,7 @@
  * provider decides what a turn means.
  */
 
+import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import { appendFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
@@ -25,9 +26,10 @@ export interface AcpHandlers {
   onDiagnostic(message: string, level: "warn" | "error"): void;
 }
 
-/** ACP wire capability set: this client reads and writes Pi's side only. */
-export const CLIENT_INFO = { name: "pi-agy-tether", version: "0.1.0" } as const;
+const { name, version } = createRequire(import.meta.url)("../package.json") as { name: string; version: string };
+export const CLIENT_INFO = { name, version } as const;
 
+/** ACP wire capability set: this client reads and writes Pi's side only. */
 export const CLIENT_CAPABILITIES = {
   fs: { readTextFile: false, writeTextFile: false },
   terminal: false,
@@ -54,7 +56,7 @@ export class AcpClient {
     // A process that dies mid-request must reject every waiter, not hang them.
     proc.once("exit", (code, signal) =>
       this.dispose(
-        `agy acp exited (${code ?? signal ?? "unknown"}) before answering`,
+        signal ? `agy was killed (signal ${signal})` : `agy acp exited (${code ?? "unknown"}) before answering`,
       ),
     );
     proc.once("error", (error) => this.dispose(`agy acp failed: ${error.message}`));

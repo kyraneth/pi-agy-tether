@@ -22,13 +22,11 @@ import { copyFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { AcpClient, CLIENT_CAPABILITIES, CLIENT_INFO } from "./acp-client.js";
 import type { AcpPromptResult } from "./event-bridge.js";
 import {
-  AGENT_NAME,
   fallbackLogProblem,
   gatewayRefusalProblem,
   markerProblem,
   newMarker,
   proofKey,
-  removeAgentRecipe,
   writeAgentRecipe,
 } from "./agent-recipe.js";
 import { agentProofPath, appDataDir, sessionDir } from "./data-dir.js";
@@ -47,6 +45,7 @@ import {
   type HandoffResult,
 } from "./handoff-broker.js";
 import { linkHostLogin } from "./login.js";
+import { assertImageSupport } from "./cli-catalog.js";
 import { rememberOfferedFamilies } from "./model-discovery.js";
 import { recordStatus } from "./cli-status.js";
 import {
@@ -63,7 +62,7 @@ import {
   type ConfigOption,
 } from "./thinking-config.js";
 import type { PromptBlock } from "./pi-context.js";
-import { assertWithinTurnLimit, planTurns, type TurnAssembly } from "./turn-budget.js";
+import { assertHistoricalReplayFits, assertWithinTurnLimit, planTurns, type TurnAssembly } from "./turn-budget.js";
 
 function modelLabel(options: readonly ConfigOption[] | undefined): string {
   const label = (id: string) => {
@@ -79,8 +78,9 @@ function assemblyFor(path: string, fromLabel: string, toLabel: string, prefaceTe
   return { appDataDirPath: path, prefaceText, settingsChange: fromLabel === toLabel ? undefined : { fromLabel, toLabel } };
 }
 
-function requestPrompt(client: AcpClient, sessionId: string, blocks: PromptBlock[], assembly: TurnAssembly, version: string): Promise<any> {
+function requestPrompt(client: AcpClient, sessionId: string, blocks: PromptBlock[], assembly: TurnAssembly, version: string, modelId: string): Promise<any> {
   assertWithinTurnLimit(blocks, assembly, version);
+  assertImageSupport(modelId, blocks);
   const prompt = assembly.prefaceText ? [{ type: "text", text: assembly.prefaceText }, ...blocks] : blocks;
   return client.request("session/prompt", { sessionId, prompt });
 }
@@ -91,7 +91,7 @@ export interface EpisodeSink {
   /** The ACP prompt terminal (`{stopReason, usage}`). */
   onPromptResult(result: AcpPromptResult): void;
   onHandoffCall(invocation: HandoffInvocation): void;
-  onClose(code: number | null): void;
+  onClose(code: number | null, signal: NodeJS.Signals | null): void;
   onFatal(message: string): void;
 }
 
@@ -108,6 +108,8 @@ export interface OpenInput {
   signature: string;
   handoffSocket: string;
   signal?: AbortSignal;
+  /** Cold Pi history, checked against the live build before recipe proof. */
+  replayMessages?: readonly any[];
 }
 
 const lifecycle = createLifecycleRevision();
@@ -145,6 +147,7 @@ export class CliProcess {
   retired = false;
   turnActive = false;
   exitCode: number | null = null;
+  exitSignal: NodeJS.Signals | null = null;
 
   private sink: EpisodeSink | undefined;
   private promptInFlight = false;
@@ -186,45 +189,64 @@ export class CliProcess {
   }
 
   /**
-   * Open a session: private config and login link, the workspace agent recipe,
+   * Open a session: private config, login link and per-session agent recipe,
    * ACP initialize/new, model and effort with readback, and a marker turn
    * if this binary and recipe format have no saved proof.
    */
   static async open(input: OpenInput): Promise<CliProcess> {
     const sessionKey = randomUUID();
-    const toolsPath = writeToolSchema(sessionKey, input.tools);
-    preparePrivateConfig();
-    const verifyLogin = await linkHostLogin();
     const logFile = join(sessionDir(sessionKey), "agy.log");
     const marker = newMarker();
-    const server = input.tools.length ? sessionMcpServer({
-      toolsPath,
-      socketPath: input.handoffSocket,
-      sessionId: sessionKey,
-      secretPath: handoffSecretFile(),
-    }) : undefined;
-    const recipe = writeAgentRecipe({
-      cwd: input.cwd,
-      marker,
-      systemPrompt: input.systemPrompt,
-      mcpServer: server,
-      mcpToolNames: input.tools.map(({ name }) => name),
-    });
-
-    if (process.env.PI_AGY_TETHER_DUMP) {
+    let recipe: ReturnType<typeof writeAgentRecipe> | undefined;
+    const cleanup = () => {
+      recipe?.dispose();
+      removeSessionFiles(sessionKey);
+    };
+    const { toolsPath, server, verifyLogin, ownedRecipe } = await (async () => {
       try {
-        copyFileSync(recipe.path, join(process.env.PI_AGY_TETHER_DUMP, "agent.md"));
-        copyFileSync(toolsPath, join(process.env.PI_AGY_TETHER_DUMP, "tools.json"));
-      } catch {
-        /* diagnostic only */
+        input.signal?.throwIfAborted();
+        preparePrivateConfig();
+        const verifyLogin = await linkHostLogin();
+        input.signal?.throwIfAborted();
+        const toolsPath = writeToolSchema(sessionKey, input.tools);
+        const server = input.tools.length ? sessionMcpServer({
+          toolsPath,
+          socketPath: input.handoffSocket,
+          sessionId: sessionKey,
+          secretPath: handoffSecretFile(),
+        }) : undefined;
+        const ownedRecipe = recipe = writeAgentRecipe({
+          sessionKey, marker, systemPrompt: input.systemPrompt, mcpServer: server,
+          mcpToolNames: input.tools.map(({ name }) => name),
+        });
+        if (process.env.PI_AGY_TETHER_DUMP) {
+          try {
+            copyFileSync(ownedRecipe.path, join(process.env.PI_AGY_TETHER_DUMP, "agent.md"));
+            copyFileSync(toolsPath, join(process.env.PI_AGY_TETHER_DUMP, "tools.json"));
+          } catch {
+            /* diagnostic only */
+          }
+        }
+        return { toolsPath, server, verifyLogin, ownedRecipe };
+      } catch (error) {
+        cleanup();
+        throw error;
       }
+    })();
+    let proc: ChildProcess;
+    try {
+      input.signal?.throwIfAborted();
+      proc = spawnAgy({
+        cwd: input.cwd, sessionId: sessionKey, logFile, signal: input.signal,
+        agentName: ownedRecipe.name,
+      });
+    } catch (error) {
+      cleanup();
+      throw error;
     }
-    const proc = spawnAgy({
-      cwd: input.cwd,
-      sessionId: sessionKey,
-      logFile,
-      signal: input.signal,
-    });
+    // A failed spawn emits close without exit. Don't remove a running child's files.
+    proc.once("exit", cleanup);
+    proc.once("close", cleanup);
     registerProcess(proc);
     const getStderr = captureStderr(proc);
 
@@ -265,8 +287,6 @@ export class CliProcess {
     const disposeOnFailure = async (error: unknown): Promise<never> => {
       client.dispose();
       forceKillProcess(proc);
-      removeAgentRecipe(input.cwd, marker);
-      removeSessionFiles(sessionKey);
       const detail = error instanceof Error ? error.message : String(error);
       const stderr = getStderr();
       throw new Error(stderr ? `${detail}: ${stderr}` : detail);
@@ -280,13 +300,15 @@ export class CliProcess {
       });
       const reportedVersion = initialized?.agentInfo?.version;
       const agentVersion = typeof reportedVersion === "string" ? reportedVersion : "unknown";
-      const key = proofKey(agentVersion);
+      if (input.replayMessages)
+        assertHistoricalReplayFits(input.replayMessages, { appDataDirPath: appDataDir() }, agentVersion);
+      const key = proofKey(agentVersion, input.modelId);
       const proofPath = key ? agentProofPath(key) : undefined;
 
       const opened = await client.request("session/new", {
         cwd: input.cwd,
         mcpServers: server ? [server] : [],
-        // Proven probe parameter: never offer agy's own engine tools.
+        // Request suppression; ACP does not attest to the generated catalog.
         disableBuiltInTools: true,
         disable_built_in_tools: true,
       }).finally(() => checkFallback(logFile, proofPath));
@@ -317,7 +339,7 @@ export class CliProcess {
           const label = modelLabel(options);
           const preflight = await requestPrompt(client, sessionId,
             [{ type: "text", text: "Reply with the tether session marker only." }],
-            assemblyFor(path, lastPromptLabel, label), agentVersion);
+            assemblyFor(path, lastPromptLabel, label), agentVersion, input.modelId);
           lastPromptLabel = label;
           checkFallback(logFile, proofPath);
           const problem = gatewayRefusalProblem(preflightText) ?? markerProblem(preflightText, marker);
@@ -344,7 +366,12 @@ export class CliProcess {
         if (applied.effort !== desired.effort) applied = await verifyPromptConfig(set, desired);
       }
 
-      instance = new CliProcess(proc, client, input, recipe.preface, proofPath, path, modelLabel(options), lastPromptLabel, {
+      // Check the linked credential by metadata only before exposing the session.
+      if (verifyLogin) await verifyLogin();
+      input.signal?.throwIfAborted();
+      if (proc.signalCode) throw new Error(`agy was killed (signal ${proc.signalCode})`);
+      if (proc.exitCode !== null) throw new Error("agy exited during session setup");
+      instance = new CliProcess(proc, client, input, ownedRecipe.preface, proofPath, path, modelLabel(options), lastPromptLabel, {
         sessionKey,
         agentVersion,
         offeredModels,
@@ -356,22 +383,19 @@ export class CliProcess {
       instance.sessionId = sessionId;
       phase = "ready";
       live.add(instance);
-      if (server) registerHandoffTarget(sessionKey, instance);
+      if (server) registerHandoffTarget(sessionKey, instance, input.tools.map(({ name }) => name));
       recordStatus({
         agentVersion,
-        agentName: AGENT_NAME,
+        agentName: ownedRecipe.name,
         agentProof: verify ? "marker" : "cached",
         offeredModels,
         configured: { model: input.modelId, effort: applied.effort ?? "unset" },
         loginLinked: true,
       });
 
-      proc.once("exit", (code) => instance?.handleExit(code));
+      proc.once("exit", (code, signal) => instance?.handleExit(code, signal));
       proc.once("error", (error) => instance?.fatal(error.message));
 
-      // Record the login link state for the caller's post-run check without
-      // reading the credential. A refreshed token is metadata, not an incident.
-      if (verifyLogin) await verifyLogin();
       return instance;
     } catch (error) {
       return disposeOnFailure(error);
@@ -379,7 +403,7 @@ export class CliProcess {
   }
 
   get alive(): boolean {
-    return !this.retired && this.exitCode === null;
+    return !this.retired && this.exitCode === null && this.exitSignal === null;
   }
 
   get hasPendingHandoffs(): boolean {
@@ -403,8 +427,9 @@ export class CliProcess {
     else this.sink?.onFatal(message);
   }
 
-  private handleExit(code: number | null): void {
+  private handleExit(code: number | null, signal: NodeJS.Signals | null = null): void {
     this.exitCode = code;
+    this.exitSignal = signal;
     live.delete(this);
     unregisterHandoffTarget(this.sessionKey);
     if (this.retired) return;
@@ -414,34 +439,20 @@ export class CliProcess {
         isError: true,
       });
     this.pending.clear();
-    this.sink?.onClose(code);
+    this.sink?.onClose(code, signal);
   }
 
   /**
    * ACP asks whether the model may run one tool call. Pi's authority is the
-   * broker: allow only a call whose tool is delivered to Pi's handoff, deny
-   * everything else. Vendor tools are excluded by the agent recipe, so a denial
-   * here is a safety net, not a normal path.
+   * broker: authorize only the exact declared Pi proxy on the active ACP
+   * session. Recipe settings about what agy should offer are not authority.
    */
   decidePermission(params: any): { outcome: "allowed" | "denied" } {
-    if (this.stagedCapture) return { outcome: "denied" };
-    const toolCall = params?.toolCall;
-    const directPrefix = `mcp_${MCP_SERVER_NAME}_`;
-    // Eager calls have a qualified name, but no ServerName in their arguments.
-    if (typeof toolCall?.name === "string" && toolCall.name.startsWith(directPrefix)) {
-      const name = toolCall.name.slice(directPrefix.length);
-      return {
-        outcome: params.sessionId === this.sessionId && this.input.tools.some((tool) => tool.name === name)
-          ? "allowed" : "denied",
-      };
-    }
-    const server = toolCall?.rawInput?.ServerName ?? toolCall?.args?.ServerName;
-    if (server === MCP_SERVER_NAME) return { outcome: "allowed" };
-    // Named MCP routing may arrive without a ServerName; the broker still
-    // rejects an undeclared tool, so allow the exact Pi proxy by its title.
-    if (typeof toolCall?.title === "string" && /MCP Tool/i.test(toolCall.title))
-      return { outcome: "allowed" };
-    return { outcome: "denied" };
+    const name = params?.toolCall?.name;
+    const allowed = !this.retired && !this.stagedCapture && this.promptInFlight &&
+      params?.sessionId === this.sessionId &&
+      this.input.tools.some(tool => name === `mcp_${MCP_SERVER_NAME}_${tool.name}`);
+    return { outcome: allowed ? "allowed" : "denied" };
   }
 
   attach(sink: EpisodeSink): void {
@@ -485,8 +496,8 @@ export class CliProcess {
 
   /** Broker callback: a Pi tool call is blocked and waiting for Pi. */
   onHandoffCall(invocation: HandoffInvocation): void {
-    if (this.stagedCapture) {
-      invocation.respond({ content: [{ type: "text", text: "Pi is staging context; tool not executed" }], isError: true });
+    if (!this.alive || this.stagedCapture || !this.promptInFlight) {
+      invocation.respond({ content: [{ type: "text", text: "Pi is not accepting tool calls; tool not executed" }], isError: true });
       return;
     }
     this.pending.set(invocation.piCallId, invocation);
@@ -531,7 +542,7 @@ export class CliProcess {
   private startPrompt(blocks: PromptBlock[]): Promise<AcpPromptResult> {
     if (this.promptInFlight) throw new Error("agy session already has a prompt in flight");
     checkFallback(this.logFile, this.proofPath);
-    const result = requestPrompt(this.client, this.sessionId, blocks, this.nextAssembly(), this.agentVersion);
+    const result = requestPrompt(this.client, this.sessionId, blocks, this.nextAssembly(), this.agentVersion, this.modelId);
     this.promptInFlight = true;
     this.turnActive = true;
     this.firstPromptPreface = [];
@@ -607,8 +618,6 @@ export class CliProcess {
     this.pending.clear();
     this.client.dispose("agy tether session retired");
     forceKillProcess(this.proc);
-    removeAgentRecipe(this.input.cwd, this.marker);
-    removeSessionFiles(this.sessionKey);
   }
 
   retirementReasons(): string[] {

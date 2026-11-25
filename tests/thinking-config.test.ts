@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { assertConfigApplied, configureSession, desiredConfig, verifyPromptConfig } from "../src/thinking-config.js";
+
+import { FALLBACK_FAMILIES, familiesFromOffered, setAgyCatalog } from "../src/cli-catalog.js";
+
+afterEach(() => setAgyCatalog(FALLBACK_FAMILIES));
 
 const options = (model: string, level: string) => [
   { id: "model", currentValue: model },
@@ -8,31 +12,34 @@ const options = (model: string, level: string) => [
 
 describe("desiredConfig", () => {
   it("maps a Pi model and level to ACP option values", () => {
-    expect(desiredConfig("gemini-3.8-flash", "high")).toEqual({
-      family: "gemini-3.8-flash",
+    expect(desiredConfig("claude-sonnet-5-5", "high")).toEqual({
+      family: "claude-sonnet-5-5",
       effort: "high",
     });
   });
 
   it("leaves effort unset when Pi asked for no thinking level", () => {
-    expect(desiredConfig("gemini-4-argon", "off")).toEqual({
-      family: "gemini-4-argon",
+    expect(desiredConfig("gemini-4-hydrogen", "off")).toEqual({
+      family: "gemini-4-hydrogen",
       effort: undefined,
     });
   });
 
   it("refuses an unknown family", () => {
-    // Neon is offered by agy but was not discovered in this process.
-    expect(() => desiredConfig("gemini-4-neon", "low")).toThrow(
-      /not a family agy advertises or this tether registers/,
-    );
     expect(() => desiredConfig("gemini-5-nova", "low")).toThrow(
-      /not a family agy advertises or this tether registers/,
+      /not a family agy advertises or this tether registers; refusing/,
     );
   });
 
   it("refuses an unsupported level", () => {
-    expect(() => desiredConfig("gemini-4-argon", "xhigh")).toThrow(/does not offer/);
+    expect(() => desiredConfig("gemini-4-hydrogen", "max")).toThrow(/does not offer thinking level max/);
+  });
+
+  it("configures GPT-OSS by exact fixed-effort ID", () => {
+    const id = "gpt-oss-120b-medium";
+    setAgyCatalog(familiesFromOffered([{ id }], new Map([[id, "GPT-OSS 120B (Medium)"]])));
+    expect(desiredConfig(id, undefined)).toEqual({ family: id, effort: undefined });
+    expect(() => desiredConfig(id, "medium")).toThrow(/does not offer adjustable thinking levels/);
   });
 });
 

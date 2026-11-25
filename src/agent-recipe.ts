@@ -1,13 +1,12 @@
 /**
- * The workspace-local agent agy is asked to load, and the marker that proves it
+ * The private agent agy is asked to load, and the marker that proves it
  * did.
  *
  * agy can return a successful `session/new` for an unknown agent while logging
  * `Agent "..." not found, falling back to default`. The
  * tether therefore does three things for every ACP session it opens:
  *
- *   1. writes the proven explicit-only recipe into the workspace
- *      (`.agents/agents/pi-local-explicit/agent.md`);
+ *   1. writes an explicit-only recipe into the private Gemini home;
  *   2. asks the loaded agent to echo a per-session marker and refuses when the
  *      exact marker does not come back;
  *   3. refuses when the agy log reports the fallback.
@@ -17,25 +16,18 @@
  * tools, and one explicitly declared `pi` MCP server that only proxies to Pi.
  */
 
-import { mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { geminiDir } from "./data-dir.js";
 
-export const AGENT_NAME = "pi-local-explicit";
-export const AGENT_RELATIVE_PATH = join(
-  ".agents",
-  "agents",
-  AGENT_NAME,
-  "agent.md",
-);
-
-// Bump when the on-disk agent format or its binding instructions change.
-const RECIPE_FORMAT = 1;
+// Bump when agent discovery, format or binding instructions change.
+const RECIPE_FORMAT = 4;
 
 /** Private pass filename for the version reported by this binary's handshake. */
-export function proofKey(agentVersion: string): string | undefined {
+export function proofKey(agentVersion: string, modelId: string): string | undefined {
   if (!agentVersion.trim() || agentVersion === "unknown") return undefined;
-  return createHash("sha256").update(JSON.stringify([agentVersion, RECIPE_FORMAT])).digest("hex");
+  return createHash("sha256").update(JSON.stringify([agentVersion, RECIPE_FORMAT, modelId])).digest("hex");
 }
 
 /** Per-session instruction marker; unique so a stale agent cannot answer it. */
@@ -47,7 +39,7 @@ export function newMarker(): string {
  * Antigravity's gateway answers some system prompts with RESOURCE_EXHAUSTED
  * (429) instead of a completion, deterministically for the same prompt text.
  * The identical text can be answered when it arrives as a user message.
- * These passages are moved, not rewritten:
+ * These passages are moved verbatim; the docs delimiters are omitted:
  *
  *  - the preamble sentence that claims the model is running inside Pi;
  *  - Pi's docs-pointer lines, which Pi renders as its `<docs>` section.
@@ -66,26 +58,41 @@ export interface SplitPrompt {
   systemPrompt: string;
   /** The exact refused lines, in their original order. */
   preface: string[];
+  /** Structural labels for the Pi notice; never expose the instruction text. */
+  changes: string[];
 }
 
 export function splitRefusedPrompt(text: string): SplitPrompt {
   const kept: string[] = [];
   const preface: string[] = [];
   let inDocs = false;
+  let removedDocsMarkers = false;
+  let movedDocs = false;
+  let movedIdentity = false;
   for (const line of text.split("\n")) {
     if (!inDocs && DOCS_OPEN.test(line)) {
       inDocs = true;
+      removedDocsMarkers = true;
       continue;
     }
     if (inDocs) {
       if (DOCS_CLOSE.test(line)) inDocs = false;
-      else preface.push(line);
+      else {
+        preface.push(line);
+        movedDocs = true;
+      }
       continue;
     }
-    if (INSIDE_PI.test(line)) preface.push(line);
-    else kept.push(line);
+    if (INSIDE_PI.test(line)) {
+      preface.push(line);
+      movedIdentity = true;
+    } else kept.push(line);
   }
-  return { systemPrompt: kept.join("\n"), preface };
+  const changes = [];
+  if (movedIdentity) changes.push('the "running inside Pi" line');
+  if (movedDocs) changes.push("the lines inside <docs> (delimiters omitted)");
+  else if (removedDocsMarkers) changes.push("the empty <docs> delimiters were omitted");
+  return { systemPrompt: kept.join("\n"), preface, changes };
 }
 
 function yamlScalar(value: string): string {
@@ -101,7 +108,7 @@ export interface McpServerEntry {
 }
 
 export interface RecipeInput {
-  cwd: string;
+  sessionKey: string;
   marker: string;
   /** Pi's own system prompt; replaces the vendor agent instructions. */
   systemPrompt: string;
@@ -111,15 +118,17 @@ export interface RecipeInput {
 }
 
 export interface WrittenRecipe {
+  name: string;
   path: string;
+  dispose(): void;
   /** What the recipe body says, i.e. Pi's prompt minus the refused lines. */
   systemPrompt: string;
   /** The refused lines, unchanged, for the first prompt of the session. */
   preface: string[];
 }
 
-export function recipePath(cwd: string): string {
-  return join(cwd, AGENT_RELATIVE_PATH);
+export function recipePath(name: string): string {
+  return join(geminiDir(), "config", "agents", name, "agent.md");
 }
 
 /**
@@ -129,13 +138,13 @@ export function recipePath(cwd: string): string {
  */
 export function writeAgentRecipe(input: RecipeInput): WrittenRecipe {
   const { systemPrompt, preface } = splitRefusedPrompt(input.systemPrompt);
-  const path = recipePath(input.cwd);
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const name = `pi-session-${input.sessionKey}`;
+  const path = recipePath(name);
   const server = input.mcpServer;
   const env = Object.entries(server?.env ?? {});
   const lines = [
     "---",
-    `name: ${AGENT_NAME}`,
+    `name: ${name}`,
     "description: Pi-owned model runtime with explicit-only MCP",
     "mainAgent: true",
     "subagent: false",
@@ -143,6 +152,7 @@ export function writeAgentRecipe(input: RecipeInput): WrittenRecipe {
     "inheritMcp: false",
     "inheritCustomizations: false",
     "tools: []",
+    "disabledTools: [list_resources, read_resource, manage_task]",
     "skills: []",
     "plugins: []",
     "agents: []",
@@ -153,9 +163,9 @@ export function writeAgentRecipe(input: RecipeInput): WrittenRecipe {
       `    command: ${yamlScalar(server.command)}`,
       "    args:",
       ...server.args.map((arg) => `      - ${yamlScalar(arg)}`),
-      // agy 1.5.12's lazy call_mcp_tool spills text above 10,240 bytes.
-      // Direct MCP calls kept the full Pi read usable in one model step, even
-      // when agy still persisted a copy. Use its documented eager registration:
+      // Eager registration avoids the lazy spill-file detour. It does not
+      // make the model-visible result lossless: agy still wraps and clips it.
+      // Use its documented eager registration:
       // https://antigravity.google/docs/mcp/#configure-eager-tools
       ...(input.mcpToolNames?.length
         ? ["    tools:", ...input.mcpToolNames.map((name) => `      ${yamlScalar(name)}: { eager: true }`)]
@@ -173,34 +183,26 @@ export function writeAgentRecipe(input: RecipeInput): WrittenRecipe {
     `Tether session marker: ${input.marker}. When asked to confirm which instructions are loaded, reply with exactly that marker and nothing else.`,
     "",
   ];
-  writeFileSync(path, lines.join("\n"), { mode: 0o600 });
-  return { path, systemPrompt, preface };
-}
-
-/** Remove this session's recipe; leaves anything the workspace already had. */
-export function removeAgentRecipe(cwd: string, marker?: string): void {
-  const path = recipePath(cwd);
+  const dir = dirname(path);
+  mkdirSync(dirname(dir), { recursive: true, mode: 0o700 });
+  mkdirSync(dir, { mode: 0o700 }); // exclusive: never adopt another session's directory
+  let disposed = false;
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* Private runtime shutdown owns any remaining files. */
+    }
+  };
   try {
-    // Another Pi session in the same workspace may have rewritten it since.
-    if (marker) {
-      const current = readFileSync(path, "utf8");
-      if (!current.includes(marker)) return;
-    }
-    rmSync(path, { force: true });
-    // rmdir only succeeds on an empty directory, so a workspace that already
-    // had its own agents keeps them; we remove only what this recipe created.
-    let dir = dirname(path);
-    while (dir !== cwd && dir.startsWith(cwd)) {
-      try {
-        rmdirSync(dir);
-      } catch {
-        break;
-      }
-      dir = dirname(dir);
-    }
-  } catch {
-    /* a leftover directory is harmless; the next spawn rewrites the file */
+    writeFileSync(path, lines.join("\n"), { mode: 0o600, flag: "wx" });
+  } catch (error) {
+    dispose();
+    throw error;
   }
+  return { name, path, systemPrompt, preface, dispose };
 }
 
 /**
@@ -211,9 +213,9 @@ export function markerProblem(
   responseText: string,
   marker: string,
 ): string | undefined {
-  if (responseText.includes(marker)) return undefined;
+  if (responseText.trim() === marker) return undefined;
   const seen = responseText.trim().slice(0, 200);
-  return `agy did not echo the ${AGENT_NAME} session marker (got ${JSON.stringify(seen)}); the requested agent was not loaded`;
+  return `agy did not echo the exact session marker (got ${JSON.stringify(seen)}); cannot verify the requested agent was loaded`;
 }
 
 /**

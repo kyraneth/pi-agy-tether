@@ -26,14 +26,21 @@ import {
   takeParkedCliProcess,
   type EpisodeSink,
 } from "./cli-process.js";
+import { assertImageSupport } from "./cli-catalog.js";
+import { splitRefusedPrompt } from "./agent-recipe.js";
 import { createEventBridge, PROVIDER_ID } from "./event-bridge.js";
 import type { ToolDefinition } from "./mcp-config.js";
 import type { HandoffResult } from "./handoff-broker.js";
+import { resultLossNotices, strictTransport, transportNotice, type ResultLossNotice } from "./degradations.js";
 import { TurnLimitError, type TurnPlan } from "./turn-budget.js";
 
 /** Extended stream options: Pi's SimpleStreamOptions plus host plumbing. */
 export type StreamViaAcpOptions = SimpleStreamOptions & {
   cwd?: string;
+  /** User-visible disclosure, not model content or a transcript message. */
+  notify?: (message: string) => void;
+  /** Record every result disclosure in Pi’s journal, including suppressed repeats. */
+  recordResultNotice?: (notice: ResultLossNotice) => void;
   /**
    * Build the Pi tool surface from the effective (post-hook) request. The
    * provider calls this after `onPayload` so a replacement tool set is what agy
@@ -86,12 +93,13 @@ function isUnsentPiFailure(message: any): boolean {
 }
 
 /** pi toolResult content → MCP tool result agy's blocked call receives. */
-export function toHandoffResult(msg: any): HandoffResult {
+export function toHandoffResult(msg: any, modelId: string): HandoffResult {
   const content: HandoffResult["content"] = [];
   const raw = msg?.content;
   if (typeof raw === "string") {
     content.push({ type: "text", text: raw });
   } else if (Array.isArray(raw)) {
+    assertImageSupport(modelId, raw);
     for (const block of raw) {
       if (!block || typeof block !== "object") continue;
       if (block.type === "text" && typeof block.text === "string") {
@@ -178,6 +186,9 @@ export function streamViaAcp(
   const stream = createAssistantMessageEventStream();
   const lifecycleRevision = getCliLifecycleRevision();
   const invalidated = () => lifecycleRevision !== getCliLifecycleRevision();
+  const strict = strictTransport();
+  const notice = (message: string, once?: string) =>
+    transportNotice(options?.sessionId, options?.notify, message, once);
 
   function failPiRequest(error: string, reason: "error" | "aborted" = "error") {
     endStreamWithError(stream, emptyMessage(model), error, reason);
@@ -189,7 +200,32 @@ export function streamViaAcp(
     return stream;
   }
 
+  async function refuseBeforePrompt(message: string, reason: string): Promise<never> {
+    const session = options?.sessionId;
+    const parked = session ? takeParkedCliProcess(session) : undefined;
+    if (parked?.hasPendingHandoffs) {
+      parked.cancel();
+      await parked.retire([reason]);
+    } else if (parked && session) {
+      parkCliProcess(session, parked, reason);
+    }
+    throw new Error(message);
+  }
+
   async function runOnce(): Promise<void> {
+    // Model defaults live on the model. An explicit zero is still a control.
+    const controls = ["temperature", "maxTokens", "toolChoice"] as const;
+    const explicit = controls.filter(key => options?.[key] !== undefined);
+    if (explicit.length) {
+      const names = explicit.join(", ");
+      if (strict) await refuseBeforePrompt(
+        `agy cannot honor explicit generation controls: ${names}. No prompt was sent for this request. Remove the controls or use a provider that honors them.`,
+        "unsupported_generation_controls",
+      );
+      const others = controls.filter(key => !explicit.includes(key));
+      notice(`agy ignored explicit generation controls: ${names}.` +
+        (others.length ? ` Also unsupported if set: ${others.join(", ")}.` : ""), "generation-controls");
+    }
     let prepared = normalizePiContext(context);
 
     // A payload hook is a mutating boundary: apply its replacement before the
@@ -215,6 +251,19 @@ export function streamViaAcp(
       }
     }
 
+    const systemPrompt = prepared.systemPrompt ?? "";
+    const { changes, preface } = splitRefusedPrompt(systemPrompt);
+    if (changes.length) {
+      const detail = changes.join(" and ");
+      if (strict) await refuseBeforePrompt(
+        `agy cannot preserve the Pi system role without the gateway workaround: ${detail}. No prompt was sent. Use a provider that can preserve the system instruction.`,
+        "system_role_changed",
+      );
+      notice(preface.length
+        ? `agy moved Pi system lines to the first user prompt: ${detail}.`
+        : `agy changed the Pi system prompt: ${detail}.`, "system-role");
+    }
+
     const cwd = options?.cwd ?? process.cwd();
     const piSessionId = options?.sessionId;
     debug("prepared", { messages: prepared.messages.length, level: options?.reasoning });
@@ -227,7 +276,6 @@ export function streamViaAcp(
       failPiRequest("agy tether has no handoff broker socket; Pi tools cannot be proxied");
       return;
     }
-    const systemPrompt = prepared.systemPrompt ?? "";
     const messages = prepared.messages as any[];
     const stale = cliSessionIsStale(messages);
     let delta = deltaMessages(messages);
@@ -243,9 +291,14 @@ export function streamViaAcp(
     let mode: "spawn" | "turn" | "handoff" = "spawn";
     let cli = piSessionId ? takeParkedCliProcess(piSessionId) : undefined;
     if (cli) {
+      if (!cli.alive && delta.some(m => m?.role === "toolResult")) {
+        const detail = cli.exitSignal ? `agy was killed (signal ${cli.exitSignal})` : "agy exited before answering";
+        await cli.retire(["exit_during_handoff"]);
+        throw new Error(`${detail}. Pi retained the tool results; no tools were retried.`);
+      }
       const checkpoint = cli.piHistory;
       const historyMatches = !!checkpoint && matchesPrefix(messages, checkpoint, historyHash);
-      if (!stale && historyMatches && cli.signature === signature) {
+      if (cli.alive && !stale && historyMatches && cli.signature === signature) {
         if (checkpoint) delta = messages.slice(checkpoint.length).filter((m) => !isUnsentPiFailure(m));
         const toolResults = delta.filter((m) => m?.role === "toolResult");
         const users = delta.filter((m) => m?.role === "user");
@@ -271,6 +324,35 @@ export function streamViaAcp(
       }
     }
 
+    if (mode !== "handoff") {
+      const constraint = prepared.tools?.length
+        ? "agy cannot verify the exact Pi tool catalog; it can omit or rewrite Pi declarations and add native tools."
+        : "agy cannot verify an empty tool catalog; native tools may still be offered.";
+      if (strict) {
+        if (cli && piSessionId) parkCliProcess(piSessionId, cli, "unverified_tool_catalog");
+        throw new Error(`${constraint} No prompt was sent. Use a provider with an exact tool catalog.`);
+      }
+      notice(constraint, "tool-catalog");
+    }
+
+    // Without the blocked call, replay would be history text, not a tool response.
+    const unboundResults = mode !== "handoff" && delta.some(m => m?.role === "toolResult");
+    if (unboundResults) {
+      if (strict) throw new Error("agy cannot verify intact tool-result delivery without the matching blocked call. Pi retained the results; no tools were retried.");
+      notice("agy lost the matching blocked call; returning Pi tool results as history text, not native tool responses. Pi retained the results.");
+    }
+
+    // Reject known text-only input before a recipe proof or warm config readback.
+    if (mode !== "handoff") {
+      try {
+        for (const message of mode === "spawn" ? messages : delta)
+          if (Array.isArray(message?.content)) assertImageSupport(model.id, message.content);
+      } catch (error) {
+        if (cli && piSessionId) parkCliProcess(piSessionId, cli, "image_input_refused");
+        throw error;
+      }
+    }
+
     // ---- 2. Or open a fresh ACP session that imports Pi's full history
     if (!cli) {
       if (invalidated() || options?.signal?.aborted) {
@@ -288,6 +370,7 @@ export function streamViaAcp(
         signature,
         handoffSocket: handoffSocket!,
         signal: options?.signal,
+        replayMessages: messages,
       });
       if (invalidated() || options?.signal?.aborted) {
         await cli.retire(["abort"]);
@@ -420,13 +503,15 @@ export function streamViaAcp(
         };
         endWithDone("toolUse");
       },
-      onClose(code) {
-        debug("close", code, live.stderr());
+      onClose(code, signal) {
+        debug("close", code, signal, live.stderr());
         if (finished) return;
         const stderr = live.stderr();
-        const message = stderr
-          ? `agy acp exited with code ${code}: ${stderr}`
-          : `agy acp exited unexpectedly with code ${code}`;
+        const message = signal
+          ? `agy was killed (signal ${signal})`
+          : stderr
+            ? `agy acp exited with code ${code}: ${stderr}`
+            : `agy acp exited unexpectedly with code ${code}`;
         endWithError(message, "error", ["exit"]);
       },
       onFatal(message) {
@@ -437,11 +522,29 @@ export function streamViaAcp(
 
     // ---- 3. Continue a parked connection: answer the blocked tool calls
     if (mode === "handoff") {
-      const deliveries = delta
-        .filter((m) => m?.role === "toolResult")
-        .map((m) =>
-          live.deliverHandoffResult(String(m.toolCallId ?? ""), toHandoffResult(m)),
-        );
+      // Validate the whole batch before answering any blocked tool call.
+      let results: { id: string; tool: string; result: HandoffResult }[];
+      try {
+        results = delta
+          .filter(m => m?.role === "toolResult")
+          .map(m => ({ id: String(m.toolCallId ?? ""), tool: String(m.toolName ?? "tool"), result: toHandoffResult(m, model.id) }));
+        if (strict) {
+          live.cancel();
+          const retained = results.map(({ tool }) => `Pi executed ${tool} and retained its result.`).join(" ");
+          throw new Error(`agy ${live.agentVersion} cannot verify intact tool-result delivery. ${retained} No tool was retried. Use a provider with lossless tool results.`);
+        }
+      } catch (error) {
+        await live.retire(["handoff_result_refused"]);
+        throw error;
+      }
+      notice("agy adds Created At and Completed At timestamps to Pi tool results.", "result-framing");
+      for (const { tool, result } of results) {
+        for (const loss of resultLossNotices(live.agentVersion, tool, result)) {
+          options?.recordResultNotice?.(loss);
+          notice(loss.message, loss.once);
+        }
+      }
+      const deliveries = results.map(({ id, result }) => live.deliverHandoffResult(id, result));
       if (!deliveries.every(Boolean)) {
         failPiRequest("agy tether could not match a Pi tool result to its blocked call");
         await live.retire(["handoff_unconfirmed"]);

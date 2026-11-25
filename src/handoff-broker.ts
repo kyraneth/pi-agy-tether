@@ -40,7 +40,7 @@ export interface HandoffTarget {
   onHandoffCall(invocation: HandoffInvocation): void;
 }
 
-const targets = new Map<string, HandoffTarget>();
+const targets = new Map<string, { target: HandoffTarget; names: ReadonlySet<string> }>();
 const openSockets = new Set<Socket>();
 let server: Server | undefined;
 let socketPath: string | undefined;
@@ -51,8 +51,9 @@ let secret: string | undefined;
 export function registerHandoffTarget(
   sessionId: string,
   target: HandoffTarget,
+  names: readonly string[],
 ): void {
-  targets.set(sessionId, target);
+  targets.set(sessionId, { target, names: new Set(names) });
 }
 
 export function unregisterHandoffTarget(sessionId: string): void {
@@ -93,8 +94,8 @@ function handle(socket: Socket): void {
       done(errorResult("Invalid invocation"));
       return;
     }
-    const target = targets.get(String(message.session ?? ""));
-    if (!target) {
+    const binding = typeof message.session === "string" ? targets.get(message.session) : undefined;
+    if (!binding) {
       done(errorResult("Pi is not attached to this session; tool not executed"));
       return;
     }
@@ -104,7 +105,11 @@ function handle(socket: Socket): void {
       done(errorResult("Invalid tool invocation"));
       return;
     }
-    target.onHandoffCall({
+    if (!binding.names.has(name)) {
+      done(errorResult("Tool not declared for this Pi session; tool not executed"));
+      return;
+    }
+    binding.target.onHandoffCall({
       piCallId: randomUUID(),
       name,
       arguments: args,

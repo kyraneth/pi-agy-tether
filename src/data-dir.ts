@@ -63,7 +63,7 @@ export function catalogCachePath(): string {
   return join(tetherHome(), "models.json");
 }
 
-/** The cached agent-proof marker for one agy version. Read-tolerant; writes are best-effort. */
+/** The cached proof for one agy version, recipe format, and family. Read-tolerant; writes are best-effort. */
 export function agentProofPath(key: string): string {
   return join(tetherHome(), `agent-proof-${key}`);
 }

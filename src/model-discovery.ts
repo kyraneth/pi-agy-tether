@@ -1,5 +1,5 @@
 /**
- * Which Gemini families agy offers this login, learned from agy itself.
+ * Which model families agy offers this login, learned from agy itself.
  *
  * agy 1.5.12 keeps its model catalog in memory only: neither `agy models` nor a
  * real ACP `session/new` writes one to its data dir. The build does advertise the list on `session/new`,
@@ -36,6 +36,9 @@ import {
   spawnAcpProbe,
 } from "./process-manager.js";
 
+// v2 invalidates Gemini-only caches so upgrades rediscover every offered family.
+const CACHE_VERSION = 2;
+
 /** Read one cached entry as an offered family, or nothing if it is not one. */
 function parseCached(entry: unknown): OfferedFamily | undefined {
   const raw = (entry ?? {}) as {
@@ -43,7 +46,7 @@ function parseCached(entry: unknown): OfferedFamily | undefined {
     name?: unknown;
     effortLevels?: unknown;
   };
-  if (typeof raw.id !== "string" || !raw.id.startsWith("gemini")) return undefined;
+  if (typeof raw.id !== "string" || raw.id.length === 0) return undefined;
   const levels = Array.isArray(raw.effortLevels)
     ? raw.effortLevels.filter((level): level is string => typeof level === "string")
     : [];
@@ -57,8 +60,8 @@ function parseCached(entry: unknown): OfferedFamily | undefined {
 /** The families the last session advertised, or nothing if the cache is unusable. */
 export function readCachedFamilies(path = catalogCachePath()): AgyFamily[] | undefined {
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as { families?: unknown };
-    if (!Array.isArray(parsed.families)) return undefined;
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as { version?: unknown; families?: unknown };
+    if (parsed.version !== CACHE_VERSION || !Array.isArray(parsed.families)) return undefined;
     const families = parsed.families
       .map(parseCached)
       .filter((family): family is OfferedFamily => family !== undefined)
@@ -75,6 +78,7 @@ export function writeCachedFamilies(
   path = catalogCachePath(),
 ): void {
   const payload = {
+    version: CACHE_VERSION,
     source: "agy acp session/new",
     families: families.map(({ id, name, effortLevels }) => ({ id, name, effortLevels })),
   };

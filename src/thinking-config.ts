@@ -35,7 +35,7 @@ export function desiredConfig(
   const family = familyFor(modelId);
   if (!family)
     throw new Error(
-      `${modelId} is not a family agy advertises or this tether registers (agy's Claude and GPT-OSS models are offered but not registered); refusing to guess a family or effort`,
+      `${modelId} is not a family agy advertises or this tether registers; refusing to guess a family or effort`,
     );
   return { family: family.id, effort: effortFor(family, thinkingLevel) };
 }

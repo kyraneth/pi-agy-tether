@@ -12,6 +12,7 @@
 const fs = require("node:fs");
 const net = require("node:net");
 const readline = require("node:readline");
+const { version } = require("../package.json");
 
 const [toolsPath, socketPath, sessionId, secretPath] = process.argv.slice(2);
 if (!toolsPath || !socketPath || !sessionId || !secretPath) process.exit(1);
@@ -101,7 +102,7 @@ rl.on("line", (line) => {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "pi-agy-tether-tools", version: "0.1.0" },
+        serverInfo: { name: "pi-agy-tether-tools", version },
       },
     });
   else if (message.method === "tools/list")

@@ -21,7 +21,6 @@ import {
 import { delimiter, join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { APP_DATA_NAME, appDataDir, geminiDir, sessionDir } from "./data-dir.js";
-import { AGENT_NAME } from "./agent-recipe.js";
 
 /** Executable override for tests and the isolated proof. */
 export const CLI_ENV = "PI_AGY_TETHER_CLI";
@@ -117,6 +116,7 @@ export function preparePrivateConfig(): string {
 
 export interface SpawnInput {
   cwd: string;
+  agentName: string;
   sessionId: string;
   /** Absolute path agy writes its own diagnostics to. */
   logFile: string;
@@ -131,7 +131,7 @@ export function spawnAgy(input: SpawnInput): ChildProcess {
     "--log-file",
     input.logFile,
     "--agent",
-    AGENT_NAME,
+    input.agentName,
     "--include-default-customizations=false",
   ];
   const proc = spawn(bin, args, {

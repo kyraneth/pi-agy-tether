@@ -49,7 +49,7 @@ describe("handoff broker", () => {
         expect(invocation.arguments).toEqual({ path: "seed.txt" });
         invocation.respond({ content: [{ type: "text", text: "seed=42" }] });
       },
-    });
+    }, ["read"]);
     const result = await invoke({ type: "call", session: "sess-1", name: "read", arguments: { path: "seed.txt" } });
     expect(result).toEqual({ type: "result", content: [{ type: "text", text: "seed=42" }] });
   });
@@ -59,6 +59,19 @@ describe("handoff broker", () => {
     const result = await invoke({ type: "call", session: "sess-9", name: "read", arguments: {} });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not attached/);
+  });
+
+  it("refuses an undeclared name on the correct authenticated session", async () => {
+    let invoked = false;
+    registerHandoffTarget("scope", {
+      onHandoffCall: (invocation) => {
+        invoked = true;
+        invocation.respond({ content: [{ type: "text", text: "unexpected" }] });
+      },
+    }, ["read"]);
+    const result = await invoke({ type: "call", session: "scope", name: "foreign", arguments: {} });
+    expect(invoked).toBe(false);
+    expect(result.isError).toBe(true);
   });
 
   it("refuses a call without the secret", async () => {

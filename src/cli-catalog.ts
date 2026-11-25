@@ -1,39 +1,22 @@
 /**
- * Which models this tether registers: the Gemini families agy itself offers,
- * with the limits agy itself reports.
+ * Register one Pi model per family advertised in ACP session/new. Adjustable
+ * variants (such as gemini-4-neon-high) become thinking levels, not separate
+ * model IDs. A literal match to an ACP model option takes precedence over
+ * suffix parsing.
  *
- * agy 1.5.12 does not persist its model catalog. Its own `v1internal:
- * fetchAvailableModels` table is held in memory for the process, and a copy of
- * `agy models`, a real ACP `session/new` and a fresh data dir leave only session
- * state behind. The offered list is read from
- * the build's ACP answer, and the limits come from that same catalog: context
- * 1,048,576 for every family, and the per-family output below.
- *
- * ACP advertises each family once per effort level (`gemini-4-neon-high`, ...),
- * so the rows are grouped: one Pi model per family, with the levels agy offers
- * for it in `thinkingLevelMap` — not one row per suffix plus a second,
- * contradictory effort selector.
- *
- * Only Gemini families offered by agy are registered.
- *
- * Image input is declared only when the installed build advertises
- * `promptCapabilities.image` in its ACP `initialize` answer; the rows are re-registered with images once
- * that handshake says so. Claiming vision for a build that does not advertise
- * it would let Pi send content the vendor drops silently.
+ * Image input requires both known family support and the installed build's
+ * ACP promptCapabilities.image declaration.
  */
 
 import { getBuiltinModels as getModels } from "@earendil-works/pi-ai/providers/all";
 
-export type AgyEffort = "low" | "medium" | "high" | "xhigh";
-
 /** agy's effort suffixes, in the order it lists them. */
-export const AGY_EFFORTS: readonly AgyEffort[] = ["low", "medium", "high", "xhigh"];
+export const AGY_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type AgyEffort = (typeof AGY_EFFORTS)[number];
 
-export interface AgyFamily {
+export interface AgyFamily extends ReportedLimits {
   id: string;
   name: string;
-  contextWindow: number;
-  maxTokens: number;
   /** Levels agy advertises for this family, in agy's order. */
   effortLevels: readonly AgyEffort[];
   /** False when agy lists the family without reporting its limits. */
@@ -50,25 +33,36 @@ export interface OfferedFamily {
 interface ReportedLimits {
   contextWindow: number;
   maxTokens: number;
+  supportsImages: boolean;
 }
 
 /**
- * The limits agy reports for the families it offers this login.
- *
- * Source: the model limits reported by agy 1.5.12. ACP's `usage_update`
- * also reports the context window as `size: 1048576`.
+ * Sources: the model catalog reported by agy 1.5.12, ACP usage_update
+ * context sizes, and Pi's built-in Anthropic catalog for Claude 4.6.
  *
  * Google's model page says Neon's context is 512K; agy reports 1,048,576 and
  * agy is what runs the turn, so agy's number is the one registered.
  */
-const AGY_LIMITS: Record<string, ReportedLimits> = {
-  "gemini-4-neon": { contextWindow: 1_048_576, maxTokens: 262_144 },
-  "gemini-4-argon": { contextWindow: 1_048_576, maxTokens: 65_536 },
-  "gemini-4-hydrogen": { contextWindow: 1_048_576, maxTokens: 262_144 },
-  "gemini-3.8-flash": { contextWindow: 1_048_576, maxTokens: 65_536 },
-  "gemini-pro-orchestrator-neon": { contextWindow: 1_048_576, maxTokens: 262_144 },
-  "gemini-pro-orchestrator-g1-pro": { contextWindow: 1_048_576, maxTokens: 65_536 },
-};
+const GEMINI_LONG_OUTPUT = { contextWindow: 1_048_576, maxTokens: 262_144, supportsImages: true };
+const GEMINI_SHORT_OUTPUT = { contextWindow: 1_048_576, maxTokens: 65_536, supportsImages: true };
+const CLAUDE = { contextWindow: 1_000_000, maxTokens: 128_000, supportsImages: true };
+
+const AGY_LIMITS = new Map<string, ReportedLimits>([
+  ["gemini-4-neon", GEMINI_LONG_OUTPUT],
+  ["gemini-4-carbon", GEMINI_LONG_OUTPUT],
+  ["gemini-4-argon", GEMINI_SHORT_OUTPUT],
+  ["gemini-4-hydrogen", GEMINI_LONG_OUTPUT],
+  ["gemini-3.8-flash", GEMINI_SHORT_OUTPUT],
+  ["gemini-pro-orchestrator-neon", GEMINI_LONG_OUTPUT],
+  ["gemini-pro-orchestrator", GEMINI_LONG_OUTPUT],
+  ["gemini-pro-orchestrator-argon", GEMINI_SHORT_OUTPUT],
+  ["gemini-pro-orchestrator-g1-pro", GEMINI_SHORT_OUTPUT],
+  ["claude-opus-5-5", CLAUDE],
+  ["claude-sonnet-5-5", CLAUDE],
+  ["claude-opus-4-6", CLAUDE],
+  ["claude-sonnet-4-6", CLAUDE],
+  ["gpt-oss-120b-medium", { contextWindow: 131_072, maxTokens: 32_768, supportsImages: false }],
+]);
 
 /**
  * Numbers for a family agy offers but reports no limits for. Pi needs a context
@@ -80,45 +74,40 @@ const AGY_LIMITS: Record<string, ReportedLimits> = {
 const UNREPORTED_LIMITS: ReportedLimits = {
   contextWindow: 1_048_576,
   maxTokens: 65_536,
+  supportsImages: false,
 };
 
 /** `Gemini 4 Neon (High)` → `Gemini 4 Neon`; the variant's own family name. */
 function stripEffortSuffix(name: string | undefined, id: string): string {
-  const stripped = name?.replace(/\s*\((low|medium|high|xhigh)\)$/i, "");
+  const stripped = name?.replace(/\s*\((low|medium|high|xhigh|max)\)$/i, "");
   return stripped && stripped.length > 0 ? stripped : id;
 }
 
 /** Attach agy's reported limits to one offered family. */
 export function familyRow(offered: OfferedFamily): AgyFamily {
-  const limits = AGY_LIMITS[offered.id];
-  const reported = limits !== undefined;
-  const resolved = limits ?? UNREPORTED_LIMITS;
+  const limits = AGY_LIMITS.get(offered.id);
   return {
     id: offered.id,
     name: offered.name,
-    contextWindow: resolved.contextWindow,
-    maxTokens: resolved.maxTokens,
+    ...(limits ?? UNREPORTED_LIMITS),
     effortLevels: [...offered.effortLevels].sort(
       (a, b) => AGY_EFFORTS.indexOf(a) - AGY_EFFORTS.indexOf(b),
     ),
-    limitsReported: reported,
+    limitsReported: limits !== undefined,
   };
 }
 
-/**
- * The three families this tether registered before it read agy's list, kept for
- * when nothing can be read at all (no cache, no answer from the build).
- */
+/** Provisional choices only: live ACP readback still verifies availability. */
 const FALLBACK: OfferedFamily[] = [
-  { id: "gemini-4-argon", name: "Gemini 4 Argon", effortLevels: ["low", "medium", "high"] },
   { id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen", effortLevels: ["low", "medium", "high", "xhigh"] },
-  { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash", effortLevels: ["low", "medium", "high"] },
+  { id: "gemini-4-neon", name: "Gemini 4 Neon", effortLevels: ["low", "medium", "high", "xhigh"] },
+  { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", effortLevels: ["low", "medium", "high"] },
 ];
 
 export const FALLBACK_FAMILIES: readonly AgyFamily[] = FALLBACK.map(familyRow);
 
 /**
- * Group agy's per-effort variant list into one family per Gemini base id.
+ * Group agy's per-effort variant list into one row per family.
  *
  * `variants` is ACP `models.availableModels`; `familyNames` is the `model`
  * config option, which carries the family's own display name ("Gemini 4 Neon")
@@ -130,9 +119,10 @@ export function familiesFromOffered(
 ): AgyFamily[] {
   const grouped = new Map<string, { name?: string; effortLevels: AgyEffort[] }>();
   for (const variant of variants) {
-    // Claude Opus/Sonnet and GPT-OSS arrive in the same list; not ours.
-    if (!variant.id.startsWith("gemini")) continue;
-    const effort = AGY_EFFORTS.find((level) => variant.id.endsWith(`-${level}`));
+    // GPT-OSS's "-medium" is part of its literal model option, not an effort.
+    const effort = familyNames.has(variant.id)
+      ? undefined
+      : AGY_EFFORTS.find((level) => variant.id.endsWith(`-${level}`));
     const id = effort
       ? variant.id.slice(0, -(effort.length + 1))
       : variant.id;
@@ -145,7 +135,7 @@ export function familiesFromOffered(
   return [...grouped].map(([id, entry]) =>
     familyRow({
       id,
-      name: familyNames.get(id) ?? stripEffortSuffix(entry.name, id),
+      name: familyNames.get(id) || (entry.effortLevels.length ? stripEffortSuffix(entry.name, id) : entry.name || id),
       effortLevels: entry.effortLevels,
     }),
   );
@@ -170,8 +160,8 @@ export function familiesFromSessionNew(opened: unknown): AgyFamily[] {
     : undefined;
   const familyNames = new Map<string, string>(
     (Array.isArray(modelOption?.options) ? modelOption.options : [])
-      .filter((option: any) => typeof option?.value === "string" && typeof option?.name === "string")
-      .map((option: any) => [option.value as string, option.name as string]),
+      .filter((option: any) => typeof option?.value === "string" && option.value.length > 0)
+      .map((option: any) => [option.value as string, typeof option.name === "string" ? option.name : ""]),
   );
   return familiesFromOffered(variants, familyNames);
 }
@@ -194,6 +184,12 @@ export function familyFor(modelId: string): AgyFamily | undefined {
   return catalog.find((family) => family.id === modelId);
 }
 
+/** Do not send image blocks on the wire when this family cannot carry them. */
+export function assertImageSupport(modelId: string, blocks: readonly { type?: unknown }[]): void {
+  if (familyFor(modelId)?.supportsImages === false && blocks.some(b => b?.type === "image"))
+    throw new Error(`pi-agy-tether refused to send image input to ${modelId}: this model is text-only and agy would drop or reject images.`);
+}
+
 /**
  * Pi thinking level → this family's offered effort. `off`/`minimal` mean "do
  * not ask for a level" (agy has no off switch), and a level agy does not offer
@@ -205,6 +201,8 @@ export function effortFor(
 ): AgyEffort | undefined {
   if (thinkingLevel === undefined || thinkingLevel === "off" || thinkingLevel === "minimal")
     return undefined;
+  if (family.effortLevels.length === 0)
+    throw new Error(`${family.id} does not offer adjustable thinking levels (fixed by agy); omit --thinking or use off.`);
   if ((family.effortLevels as readonly string[]).includes(thinkingLevel))
     return thinkingLevel as AgyEffort;
   throw new Error(
@@ -231,33 +229,29 @@ export function thinkingLevelMap(
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-function builtinGoogleCosts(): ReadonlyMap<string, any> {
-  try {
-    return new Map(getModels("google").map((model) => [model.id, model.cost]));
-  } catch {
-    return new Map();
-  }
+function builtinModelCosts(): ReadonlyMap<string, typeof ZERO_COST> {
+  const costs = new Map<string, typeof ZERO_COST>();
+  for (const provider of ["google", "anthropic", "openai"] as const)
+    for (const model of getModels(provider)) costs.set(model.id, model.cost);
+  return costs;
 }
 
 /**
- * Rows for `pi.registerProvider`. Known Gemini models carry Pi's built-in
- * Google list rates so `calculateCost` reports notional API spend (matching
- * subscription-tether convention); unlisted families stay at zero rather than
- * guessing.
+ * Rows for `pi.registerProvider`: first-party list rates are notional API
+ * spend, not subscription charges. Unlisted families stay at zero.
  */
 export function agyModels(
   options: { images?: boolean } = {},
   families: readonly AgyFamily[] = catalog,
 ): any[] {
-  const input: ("text" | "image")[] = options.images ? ["text", "image"] : ["text"];
-  const costs = builtinGoogleCosts();
+  const costs = builtinModelCosts();
   return families.map((family) => ({
     id: family.id,
     // The reader picks from this name, and the row still has to carry a number
     // Pi can budget with, so the note lives here rather than in the cache.
     name: family.limitsReported ? family.name : `${family.name} (limits not reported)`,
     reasoning: family.effortLevels.length > 0,
-    input,
+    input: options.images === true && family.supportsImages ? ["text", "image"] : ["text"],
     cost: costs.get(family.id) ?? ZERO_COST,
     contextWindow: family.contextWindow,
     maxTokens: family.maxTokens,

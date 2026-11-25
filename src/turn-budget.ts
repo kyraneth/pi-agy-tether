@@ -68,6 +68,24 @@ export function assertWithinTurnLimit(blocks: PromptBlock[], assembly: TurnAssem
   if (limit) assertFits(measureTurn(blocks, assembly), limit, version);
 }
 
+/** Refuse a provably oversized historical entry without generating a marker.
+ * Use the smallest possible assembly, not a guess at settings or staging
+ * overhead. The full planner still checks actual frames before dispatch.
+ */
+export function assertHistoricalReplayFits(messages: readonly any[], assembly: TurnAssembly, version: string): void {
+  if (!KNOWN_TURN_INPUT_LIMITS.has(version)) return;
+  const limit = turnInputLimitFor(version);
+  if (!limit) return;
+  for (const [index, entry] of messages.entries()) {
+    const role = entry?.role;
+    if (role === "user" && index === messages.length - 1) continue;
+    if (role !== "user" && role !== "assistant" && role !== "toolResult") continue;
+    const label = role === "toolResult" ? "tool result" : `${role} message`;
+    assertFits(measureTurn(replayPiMessages([entry]), assembly), limit, version,
+      `historical ${label} ${index + 1}/${messages.length} cannot fit on its own; no historical tool was replayed. Use a provider that can restore this journal, or curate a Pi branch or summary`);
+  }
+}
+
 function framed(blocks: PromptBlock[], index: number, total: number): PromptBlock[] {
   if (index === total) return [text(`[Pi tether context part ${total}/${total} (final). Combine all ${total} parts above in order and now follow the instructions below.]\n`), ...blocks];
   return [

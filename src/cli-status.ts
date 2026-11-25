@@ -2,7 +2,7 @@
  * What the last ACP session established, for the `agy-cli` status command.
  *
  * The handshake is observed live; the proof records whether the marker
- * was verified in this session or reused for this client and recipe version.
+ * was verified here or reused for this client version, recipe format, and family.
  */
 
 export interface CliStatus {

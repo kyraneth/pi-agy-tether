@@ -32,8 +32,12 @@ const sessionNew = () => ({
       { modelId: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)" },
       { modelId: "gemini-3.8-flash-medium", name: "Gemini 3.8 Flash (Medium)" },
       { modelId: "gemini-3.8-flash-low", name: "Gemini 3.8 Flash (Low)" },
-      { modelId: "claude-opus-5-5-low", name: "Claude Opus 5.5 (Low)" },
-      { modelId: "claude-sonnet-5-5-high", name: "Claude Sonnet 5.5 (High)" },
+      ...["opus", "sonnet"].flatMap((family) => ["low", "medium", "high"].map((effort) => ({
+        modelId: `claude-${family}-5-5-${effort}`,
+      }))),
+      { modelId: "gemini-4-carbon-high" },
+      { modelId: "gemini-pro-orchestrator" },
+      { modelId: "gemini-pro-orchestrator-argon" },
       { modelId: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
     ],
   },
@@ -45,6 +49,7 @@ const sessionNew = () => ({
         { value: "gemini-4-argon", name: "Gemini 4 Argon" },
         { value: "gemini-pro-orchestrator-neon", name: "Orchestrator (Neon)" },
         { value: "claude-opus-5-5", name: "Claude Opus 5.5" },
+        { value: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
         { value: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
       ],
     },
@@ -64,6 +69,12 @@ describe("agy's offered list", () => {
       "gemini-pro-orchestrator-neon",
       "gemini-pro-orchestrator-g1-pro",
       "gemini-3.8-flash",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "gemini-4-carbon",
+      "gemini-pro-orchestrator",
+      "gemini-pro-orchestrator-argon",
+      "gpt-oss-120b-medium",
     ]);
     expect(families.find((f) => f.id === "gemini-4-neon")!.effortLevels).toEqual([
       "low",
@@ -75,10 +86,22 @@ describe("agy's offered list", () => {
     expect(families.find((f) => f.id === "gemini-pro-orchestrator-neon")!.effortLevels).toEqual([]);
   });
 
-  it("keeps only Gemini families", () => {
-    const ids = familiesFromSessionNew(sessionNew()).map((f) => f.id);
-    expect(ids.some((id) => id.startsWith("claude-"))).toBe(false);
-    expect(ids.some((id) => id.startsWith("gpt-oss"))).toBe(false);
+  it("preserves fixed-effort IDs and groups adjustable third-party variants", () => {
+    const families = familiesFromSessionNew(sessionNew());
+    for (const id of ["claude-opus-5-5", "claude-sonnet-5-5"])
+      expect(families.find(f => f.id === id)?.effortLevels).toEqual(["low", "medium", "high"]);
+    const oss = families.find(f => f.id === "gpt-oss-120b-medium")!;
+    expect(oss).toMatchObject({ name: "GPT-OSS 120B (Medium)", effortLevels: [] });
+    expect(() => effortFor(oss, "high")).toThrow(/does not offer adjustable thinking levels/);
+  });
+
+  it("groups max effort and maps it only when advertised", () => {
+    const session = sessionNew();
+    session.models.availableModels.push({ modelId: "claude-opus-5-5-max", name: "Claude Opus 5.5 (Max)" });
+    const opus = familiesFromSessionNew(session).find(f => f.id === "claude-opus-5-5")!;
+    expect(opus.effortLevels).toEqual(["low", "medium", "high", "max"]);
+    expect(thinkingLevelMap(opus).max).toBe("max");
+    expect(familiesFromOffered([{ id: "claude-opus-5-5-max", name: "Claude Opus 5.5 (Max)" }])[0]?.name).toBe("Claude Opus 5.5");
   });
 
   it("takes the family's own name, not the variant's", () => {
@@ -89,7 +112,6 @@ describe("agy's offered list", () => {
   it("survives a session answer with no models", () => {
     expect(familiesFromSessionNew({})).toEqual([]);
     expect(familiesFromSessionNew(undefined)).toEqual([]);
-    expect(familiesFromOffered([{ id: "claude-opus-5-5-high" }])).toEqual([]);
   });
 });
 
@@ -110,6 +132,16 @@ describe("limits", () => {
     expect(orchestrator).toMatchObject({ contextWindow: 1_048_576, maxTokens: 262_144 });
   });
 
+  it("registers limits and vision for all observed families", () => {
+    const families = familiesFromSessionNew(sessionNew());
+    const lookup = (id: string) => families.find(f => f.id === id);
+    for (const id of ["claude-opus-5-5", "claude-sonnet-5-5"])
+      expect(lookup(id)).toMatchObject({ contextWindow: 1_000_000, maxTokens: 128_000, supportsImages: true });
+    expect(lookup("gpt-oss-120b-medium")).toMatchObject({ contextWindow: 131_072, maxTokens: 32_768, supportsImages: false });
+    for (const id of ["gemini-4-carbon", "gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"])
+      expect(lookup(id)).toMatchObject({ limitsReported: true, supportsImages: true });
+  });
+
   it("still registers a family whose limits agy does not report, with the note", () => {
     const [nova] = familiesFromOffered([{ id: "gemini-5-nova-low", name: "Gemini 5 Nova (Low)" }]);
     expect(nova).toMatchObject({
@@ -126,9 +158,9 @@ describe("limits", () => {
 describe("catalog rows", () => {
   it("starts on the three fallback families", () => {
     expect(agyFamilies().map((f) => f.id)).toEqual([
-      "gemini-4-argon",
       "gemini-4-hydrogen",
-      "gemini-3.8-flash",
+      "gemini-4-neon",
+      "claude-sonnet-5-5",
     ]);
     expect(familyFor("gemini-4-hydrogen")).toMatchObject({
       contextWindow: 1_048_576,
@@ -139,14 +171,18 @@ describe("catalog rows", () => {
   it("registers whatever the discovered catalog says", () => {
     setAgyCatalog(familiesFromSessionNew(sessionNew()));
     expect(familyFor("gemini-4-neon")).toBeDefined();
-    expect(familyFor("claude-opus-5-5")).toBeUndefined();
+    expect(familyFor("claude-opus-5-5")).toBeDefined();
     expect(agyModels().map((row) => row.id)).toContain("gemini-4-neon");
   });
 
-  it("advertises image input only when the build advertises it", () => {
-    for (const row of agyModels()) expect(row.input).toEqual(["text"]);
-    for (const row of agyModels({ images: true }, agyFamilies()))
-      expect(row.input).toEqual(["text", "image"]);
+  it("advertises images only with build and family support", () => {
+    const families = [...familiesFromSessionNew(sessionNew()), ...familiesFromOffered([{ id: "future" }])];
+    for (const row of agyModels({}, families)) expect(row.input).toEqual(["text"]);
+    const rows = agyModels({ images: true }, families);
+    for (const id of ["gemini-4-neon", "claude-sonnet-5-5"])
+      expect(rows.find(r => r.id === id)?.input).toEqual(["text", "image"]);
+    for (const id of ["gpt-oss-120b-medium", "future"])
+      expect(rows.find(r => r.id === id)?.input).toEqual(["text"]);
   });
 
   it("maps only the levels agy actually offers", () => {
@@ -170,26 +206,24 @@ describe("catalog rows", () => {
     expect(orchestrator.thinkingLevelMap.high).toBeNull();
   });
 
-  it("carries built-in Google list costs for known models and zero for unlisted ones", () => {
-    const google = new Map(getModels("google").map((m) => [m.id, m.cost]));
+  it("carries first-party list costs for known models and zero for unlisted ones", () => {
+    const firstParty = new Map([...getModels("google"), ...getModels("anthropic"), ...getModels("openai")].map((m) => [m.id, m.cost]));
     setAgyCatalog(familiesFromSessionNew(sessionNew()));
     for (const row of agyModels()) {
-      const expected = google.get(row.id) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      const expected = firstParty.get(row.id) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
       expect(row.cost).toEqual(expected);
     }
     expect(agyModels().find((r) => r.id === "gemini-4-argon")!.cost.input).toBeGreaterThan(0);
-    expect(agyModels().find((r) => r.id === "gemini-pro-orchestrator-neon")!.cost).toEqual({
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    });
+    for (const id of ["claude-opus-5-5", "claude-sonnet-5-5"])
+      expect(agyModels().find(r => r.id === id)?.cost.input).toBeGreaterThan(0);
+    for (const id of ["gemini-pro-orchestrator-neon", "gpt-oss-120b-medium"])
+      expect(agyModels().find(r => r.id === id)?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
   });
 });
 
 describe("effort selection", () => {
   it("passes offered levels through", () => {
-    const argon = familyFor("gemini-4-argon")!;
+    const argon = familiesFromSessionNew(sessionNew()).find(f => f.id === "gemini-4-argon")!;
     const hydrogen = familyFor("gemini-4-hydrogen")!;
     expect(effortFor(argon, "low")).toBe("low");
     expect(effortFor(argon, "high")).toBe("high");
@@ -197,20 +231,20 @@ describe("effort selection", () => {
   });
 
   it("asks for no level when Pi turned reasoning off", () => {
-    const argon = familyFor("gemini-4-argon")!;
-    expect(effortFor(argon, "off")).toBeUndefined();
-    expect(effortFor(argon, "minimal")).toBeUndefined();
-    expect(effortFor(argon, undefined)).toBeUndefined();
+    const hydrogen = familyFor("gemini-4-hydrogen")!;
+    expect(effortFor(hydrogen, "off")).toBeUndefined();
+    expect(effortFor(hydrogen, "minimal")).toBeUndefined();
+    expect(effortFor(hydrogen, undefined)).toBeUndefined();
   });
 
   it("refuses a level agy does not offer instead of clamping", () => {
-    const argon = familyFor("gemini-4-argon")!;
+    const argon = familiesFromSessionNew(sessionNew()).find(f => f.id === "gemini-4-argon")!;
     expect(() => effortFor(argon, "xhigh")).toThrow(/does not offer thinking level xhigh/);
     expect(() => effortFor(argon, "max")).toThrow(/agy offers low, medium, high/);
     // agy itself: 'Thinking level "high" is not offered for model "Orchestrator (Neon)"'.
     const orchestrator = familiesFromSessionNew(sessionNew()).find(
       (f) => f.id === "gemini-pro-orchestrator-neon",
     )!;
-    expect(() => effortFor(orchestrator, "high")).toThrow(/does not offer thinking level high/);
+    expect(() => effortFor(orchestrator, "high")).toThrow(/does not offer adjustable thinking levels/);
   });
 });
