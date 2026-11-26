@@ -7,7 +7,7 @@ process.umask(0o002);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 // Only these roots are public. New directories never enter the export implicitly.
 const allowlist = ['.gitignore', 'LICENSE', 'README.md', 'SOURCE.md', 'CHANGELOG.md', 'package.json', 'package-lock.json', 'index.ts', 'src', 'tests', 'docs', 'vitest.config.ts', 'tsconfig.json',
-  'scripts/export-manifest', 'scripts/check-public-tree.mjs'];
+  'scripts/export-manifest', 'scripts/check-public-tree.mjs', 'scripts/smoke-installed.sh'];
 const files = [];
 function visit(path) {
   const absolute = join(root, path), stat = lstatSync(absolute);

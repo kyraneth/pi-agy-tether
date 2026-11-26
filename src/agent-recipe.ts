@@ -12,8 +12,8 @@
  *   3. refuses when the agy log reports the fallback.
  *
  * The recipe uses
- * `excludeDefaultComponents`, no inherited MCP or customizations, no vendor
- * tools, and one explicitly declared `pi` MCP server that only proxies to Pi.
+ * `excludeDefaultComponents`, no inherited MCP or customizations, and either
+ * the Pi MCP surface plus zero or one explicitly allowed native tool.
  */
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -25,9 +25,11 @@ import { geminiDir } from "./data-dir.js";
 const RECIPE_FORMAT = 4;
 
 /** Private pass filename for the version reported by this binary's handshake. */
-export function proofKey(agentVersion: string, modelId: string): string | undefined {
+export type NativeTool = "generate_image" | "search_web";
+
+export function proofKey(agentVersion: string, modelId: string, nativeTool?: NativeTool): string | undefined {
   if (!agentVersion.trim() || agentVersion === "unknown") return undefined;
-  return createHash("sha256").update(JSON.stringify([agentVersion, RECIPE_FORMAT, modelId])).digest("hex");
+  return createHash("sha256").update(JSON.stringify([agentVersion, RECIPE_FORMAT, modelId, ...(nativeTool ? [nativeTool] : [])])).digest("hex");
 }
 
 /** Per-session instruction marker; unique so a stale agent cannot answer it. */
@@ -113,6 +115,7 @@ export interface RecipeInput {
   /** Pi's own system prompt; replaces the vendor agent instructions. */
   systemPrompt: string;
   mcpServer?: McpServerEntry;
+  nativeTool?: NativeTool;
   /** Pi's staged tool names, configured in the recipe (not the ACP transport entry). */
   mcpToolNames?: readonly string[];
 }
@@ -151,7 +154,7 @@ export function writeAgentRecipe(input: RecipeInput): WrittenRecipe {
     "excludeDefaultComponents: true",
     "inheritMcp: false",
     "inheritCustomizations: false",
-    "tools: []",
+    `tools: [${input.nativeTool ?? ""}]`,
     "disabledTools: [list_resources, read_resource, manage_task]",
     "skills: []",
     "plugins: []",
@@ -177,9 +180,13 @@ export function writeAgentRecipe(input: RecipeInput): WrittenRecipe {
     "---",
     systemPrompt,
     "",
-    server
-      ? "Pi supplies and executes every tool. Call Pi tools through the `pi` MCP server only; do not use native task, resource, command or browser features."
-      : "No tools are available for this request.",
+    input.nativeTool === "search_web"
+      ? `${server ? "Call Pi tools only through the `pi` MCP server. " : ""}Native search_web is permitted for the actual user request, never for a tether marker or a context-only turn. Do not use other native tools.`
+      : server
+        ? "Pi supplies and executes every tool. Call Pi tools through the `pi` MCP server only; do not use native task, resource, command or browser features."
+        : input.nativeTool
+          ? `The only tool you may use is the explicitly enabled native ${input.nativeTool}. Do not use native task, resource, command or browser features.`
+          : "No tools are available for this request.",
     `Tether session marker: ${input.marker}. When asked to confirm which instructions are loaded, reply with exactly that marker and nothing else.`,
     "",
   ];

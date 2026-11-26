@@ -1,3 +1,41 @@
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { tetherHome } from "./data-dir.js";
+
+export const GENERATION_CONTROLS_FACT = "ACP does not carry Pi's temperature, maxTokens, or toolChoice.";
+export const RESULT_FRAMING_FACT = "agy adds Created At and Completed At timestamps to Pi tool results.";
+export const TOOL_CATALOG_FACT = "agy cannot verify the exact Pi tool catalog; it can omit or rewrite Pi declarations and add native tools.";
+export const EMPTY_CATALOG_FACT = "agy cannot verify an empty tool catalog; native tools may still be offered.";
+
+export function transportLogPath(): string {
+  return join(tetherHome(), "transport.log");
+}
+
+const loggedFacts = new Set<string>();
+
+export function logTransportFact(message: string): void {
+  const path = transportLogPath();
+  const key = `${path}\0${message}`;
+  if (loggedFacts.has(key)) return;
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    appendFileSync(path, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 });
+    loggedFacts.add(key);
+  } catch {
+    // Diagnostics must neither block inference nor fall back to the screen.
+  }
+}
+
+export function transportDoctor(): string {
+  return [
+    `Strict mode: ${strictTransport() ? "on" : "off"}.`,
+    "When present, agy moves Pi's ‘running inside Pi’ line and <docs> text to the first user prompt to work around the gateway.",
+    TOOL_CATALOG_FACT, EMPTY_CATALOG_FACT, GENERATION_CONTROLS_FACT, RESULT_FRAMING_FACT,
+    "agy cannot verify intact tool-result delivery. Known clipping is reported with byte counts; Pi keeps full results.",
+    `Route diagnostics (when writable): ${transportLogPath()}`,
+  ].join("\n");
+}
+
 // Scope one-time notices to Pi's session, not the disposable ACP connection.
 const seenBySession = new Map<string, Set<string>>();
 
@@ -33,7 +71,7 @@ const OBSERVED_TIMESTAMP_BYTES = 78;
 const measuredBuilds = new Set(["1.5.12", "1.5.16"]);
 const formatBytes = new Intl.NumberFormat("en-US").format;
 
-export type ResultLossNotice = { message: string; once?: string };
+export type ResultLossNotice = { message: string; surface: "log" | "screen" };
 export const RESULT_NOTICE_ENTRY = "pi-agy-tether:result-notice";
 
 export function* resultLossNotices(
@@ -49,7 +87,7 @@ export function* resultLossNotices(
   if (causes.length) {
     for (const cause of causes) {
       yield {
-        once: `result-unverified:${cause}`,
+        surface: "log",
         message: `agy cannot verify intact delivery of ${tool} (${cause}); Pi kept the full result.`,
       };
     }
@@ -59,6 +97,6 @@ export function* resultLossNotices(
   if (block?.type !== "text") return;
   const bytes = Buffer.byteLength(block.text, "utf8");
   if (bytes + OBSERVED_TIMESTAMP_BYTES > RENDERED_TEXT_LIMIT_BYTES) {
-    yield { message: `agy clipped ${tool} from ${formatBytes(bytes)} to a ${formatBytes(RENDERED_TEXT_LIMIT_BYTES)}-byte limit; Pi kept the full result.` };
+    yield { surface: "screen", message: `agy clipped ${tool} from ${formatBytes(bytes)} to a ${formatBytes(RENDERED_TEXT_LIMIT_BYTES)}-byte limit; Pi kept the full result.` };
   }
 }

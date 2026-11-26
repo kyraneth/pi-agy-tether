@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Enable `PI_AGY_TETHER_IMAGE_TOOL=1` to generate and edit images with `agy_generate_image`. Outputs stay in the Pi session’s artifact directory; reference images are staged without overwriting them.
+- Enable `PI_AGY_TETHER_NATIVE_SEARCH=1` to let Antigravity search the web. Pi shows the opt-in once and displays each query, but search results stay inside Antigravity. Strict mode refuses native search.
+- Attribute Antigravity’s reported token use to each Pi assistant message, including messages that end at a tool call. When usage cannot be attributed, leave it and cost unavailable rather than report zero. Displayed cost is an API-price equivalent, not an Antigravity subscription charge.
+- Retire an Antigravity process that approaches the available memory budget. Interruptions are shown without retrying prompts or tools; the next request can restore history from Pi. Signal-exit messages distinguish measured memory evidence from an unexplained kill.
+- Keep standing transport limitations in the tether log and `/agy-doctor`, not in routine notifications. Actual clips still show byte counts. A request that explicitly sets an unsupported generation control warns once per Pi session. Strict mode is unchanged.
+
 ## 0.1.3
 
 - Discover every model family and thinking level Antigravity advertises for your account, including Gemini, Orchestrator, Claude, and GPT-OSS. Refresh old model lists, preserve fixed thinking settings, and show API-equivalent costs where list prices exist. Text-only models reject images instead of silently dropping them.

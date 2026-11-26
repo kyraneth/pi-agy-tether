@@ -100,6 +100,19 @@ describe("writeAgentRecipe", () => {
     expect(text).toContain("Summarize.");
   });
 
+  it("declares only native generate_image for a private image turn", () => {
+    const recipe = writeAgentRecipe({
+      sessionKey: randomUUID(), marker: newMarker(), systemPrompt: "image",
+      nativeTool: "generate_image",
+    });
+    try {
+      const text = readFileSync(recipe.path, "utf8");
+      expect(text).toContain("\ntools: [generate_image]\n");
+      expect(text).toContain("\nmcpServers: []\n");
+      expect(text).not.toContain("No tools are available");
+    } finally { recipe.dispose(); }
+  });
+
   it("registers only the staged Pi tools as eager on the MCP server", () => {
     const recipe = writeAgentRecipe({
       sessionKey: randomUUID(),

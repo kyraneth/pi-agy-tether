@@ -8,11 +8,11 @@
 
 import { registerApiDispatch } from "pi-tether-core/register";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { streamViaAcp } from "./src/provider.js";
 import { agyModels, setAgyCatalog } from "./src/cli-catalog.js";
 import { probeStartup, startupCatalog } from "./src/model-discovery.js";
 import { cliStatusLine, recordStatus } from "./src/cli-status.js";
-import { addStartupNotice, takeStartupNotices } from "./src/startup-notices.js";
 import { killAllProcesses, validateCliPresence } from "./src/process-manager.js";
 import { startHandoffBroker, stopHandoffBroker } from "./src/handoff-broker.js";
 import { cleanupRuntimeDir } from "./src/runtime-dir.js";
@@ -21,7 +21,11 @@ import { rewriteOverflowMessage } from "./src/overflow.js";
 import { piContext } from "./src/pi-context.js";
 import type { ToolDefinition } from "./src/mcp-config.js";
 import { PROVIDER_ID } from "./src/event-bridge.js";
-import { rememberTransportNotice, RESULT_NOTICE_ENTRY, type ResultLossNotice } from "./src/degradations.js";
+import { RESULT_NOTICE_ENTRY, strictTransport, transportDoctor, type ResultLossNotice } from "./src/degradations.js";
+import {
+  NATIVE_SEARCH_ENTRY, NATIVE_SEARCH_NOTICE, NATIVE_SEARCH_NOTICE_ENTRY, nativeSearchEnabled, nativeSearchLabel,
+  type NativeSearchQuery, type NativeSearchSurface,
+} from "./src/native-search.js";
 
 process.on("exit", killAllProcesses);
 process.on("exit", () => void stopHandoffBroker());
@@ -42,7 +46,7 @@ async function ensureHandoffSocket(): Promise<string> {
   return handoffSocket;
 }
 
-/** Deliver load-time configuration notices where the user can see them. */
+/** Deliver actionable events in the UI, or to stderr without a UI. */
 function notifyPi(ctx: { hasUI: boolean; ui: { notify: (message: string, type: "warning") => void } } | undefined, message: string): void {
   if (ctx?.hasUI) ctx.ui.notify(`pi-agy-tether: ${message}`, "warning");
   else console.warn(`[pi-agy-tether] ${message}`);
@@ -51,18 +55,50 @@ function notifyPi(ctx: { hasUI: boolean; ui: { notify: (message: string, type: "
 export default async function (pi: ExtensionAPI) {
   let notify: (message: string) => void = (message) => notifyPi(undefined, message);
   let recordResultNotice: ((notice: ResultLossNotice) => void) | undefined;
+  let recordUsageUnavailable: (() => void) | undefined;
+  let search: NativeSearchSurface | undefined;
+  const displayNativeSearch = nativeSearchEnabled() && !strictTransport();
+  if (displayNativeSearch) {
+    pi.registerEntryRenderer(NATIVE_SEARCH_NOTICE_ENTRY, () => new Text(NATIVE_SEARCH_NOTICE, 1, 0));
+    pi.registerEntryRenderer<NativeSearchQuery>(NATIVE_SEARCH_ENTRY, (entry) => entry.data ? new Text(nativeSearchLabel(entry.data), 1, 0) : undefined);
+  }
   pi.on("session_start", (_event, ctx) => {
     notify = (message) => notifyPi(ctx, message);
     const sessionId = ctx.sessionManager.getSessionId();
-    for (const entry of ctx.sessionManager.getEntries()) {
-      if (entry.type !== "custom" || entry.customType !== RESULT_NOTICE_ENTRY) continue;
-      const data = entry.data as ({ sessionId?: string; once?: string } | undefined);
-      if (data?.sessionId === sessionId && typeof data.once === "string") {
-        rememberTransportNotice(sessionId, data.once);
-      }
+    const entries = ctx.sessionManager.getEntries();
+    if (displayNativeSearch) {
+      let announced = entries.some(entry => entry.type === "custom" && entry.customType === NATIVE_SEARCH_NOTICE_ENTRY &&
+        (entry.data as { sessionId?: string } | undefined)?.sessionId === sessionId);
+      const surface: NativeSearchSurface = {
+        announce() {
+          if (search !== surface || announced) return;
+          announced = true;
+          pi.appendEntry(NATIVE_SEARCH_NOTICE_ENTRY, { sessionId, message: NATIVE_SEARCH_NOTICE });
+          if (!ctx.hasUI) console.warn(NATIVE_SEARCH_NOTICE);
+        },
+        record(entry) {
+          if (search !== surface) return;
+          pi.appendEntry(NATIVE_SEARCH_ENTRY, entry);
+          if (!ctx.hasUI) console.warn(nativeSearchLabel(entry));
+        },
+      };
+      search = surface;
     }
     recordResultNotice = (notice) => pi.appendEntry(RESULT_NOTICE_ENTRY, { ...notice, sessionId });
-    for (const message of takeStartupNotices()) notify(message);
+    const usageEntry = "pi-agy-tether:usage-unavailable";
+    let loggedUsage = entries.some(entry => entry.type === "custom" && entry.customType === usageEntry);
+    recordUsageUnavailable = () => {
+      if (loggedUsage) return;
+      loggedUsage = true;
+      pi.appendEntry(usageEntry, { message: "agy spend could not be attributed to a Pi assistant message. Usage and cost are unavailable; totalTokens is context occupancy." });
+    };
+  });
+
+  pi.registerCommand("agy-doctor", {
+    description: "Show persistent agy transport limitations and the diagnostic log path",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(transportDoctor(), "info");
+    },
   });
 
   try {
@@ -84,6 +120,8 @@ export default async function (pi: ExtensionAPI) {
         ...options,
         notify,
         recordResultNotice,
+        recordUsageUnavailable,
+        search,
         prepareMcp: async (effectiveContext) => {
           const toolDefs: ToolDefinition[] = piContext(effectiveContext).tools.map(
             (t: any) => ({
@@ -137,6 +175,11 @@ export default async function (pi: ExtensionAPI) {
       if (ctx.model?.provider === PROVIDER_ID) return { action: "stop" as const };
     });
 
+    if (process.env.PI_AGY_TETHER_IMAGE_TOOL === "1") {
+      const { registerImageTool } = await import("./src/image-tool.js");
+      registerImageTool(pi);
+    }
+
     pi.registerCommand("agy-cli", {
       description:
         "Show the agy ACP session facts: client version, loaded agent marker, offered models, login link",
@@ -163,10 +206,7 @@ export default async function (pi: ExtensionAPI) {
       await stopHandoffBroker();
     });
   } catch (err) {
-    addStartupNotice(
-      err instanceof Error ? err.message : String(err),
-    );
-    for (const message of takeStartupNotices()) notify(message);
+    notify(err instanceof Error ? err.message : String(err));
     console.error(`[pi-agy-tether] Failed to register provider:`, err);
   }
 }

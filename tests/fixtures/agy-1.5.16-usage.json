@@ -1,0 +1,71 @@
+{
+  "source": "agy 1.5.16 Hydrogen: 60-tool catalog, two Pi read handoffs, unchanged usage counters",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "recorded-session",
+        "update": {
+          "sessionUpdate": "usage_update",
+          "used": 19406,
+          "size": 1048576
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "recorded-session",
+        "update": {
+          "sessionUpdate": "usage_update",
+          "used": 19560,
+          "size": 1048576
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "recorded-session",
+        "update": {
+          "sessionUpdate": "usage_update",
+          "used": 19693,
+          "size": 1048576
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "result": {
+        "stopReason": "end_turn",
+        "usage": {
+          "inputTokens": 6734,
+          "outputTokens": 191,
+          "cachedReadTokens": 51734,
+          "cachedWriteTokens": 0,
+          "thoughtTokens": 90,
+          "totalTokens": 58659
+        }
+      },
+      "id": 6
+    }
+  ],
+  "baselineIndex": 2,
+  "steps": [
+    {
+      "idx": 3,
+      "field9Hex": "10ef11186228fd8401483a"
+    },
+    {
+      "idx": 5,
+      "field9Hex": "10c411183928eb86014811"
+    },
+    {
+      "idx": 7,
+      "field9Hex": "109b11182428ae8801480f"
+    }
+  ]
+}

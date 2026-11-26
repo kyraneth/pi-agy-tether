@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { acpUsage, createEventBridge, mapStopReason } from "../src/event-bridge.js";
+import recording from "./fixtures/agy-1.5.16-usage.json";
 
 const model = {
   id: "gemini-4-argon",
@@ -132,13 +133,19 @@ describe("createEventBridge", () => {
     // An initial/zero update never clobbers a positive step count.
     bridge.handleUpdate({ sessionUpdate: "usage_update", used: 0, size: 1_048_576 });
     bridge.pushToolCall({ id: "call-1", name: "read", arguments: { path: "seed.txt" } });
-    expect(bridge.getOutput().usage).toEqual({
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 31_803,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    expect(bridge.getOutput().usage).toMatchObject({
+      availability: "unavailable", input: null, output: null, cacheRead: null, cacheWrite: null,
+      totalTokens: 31_803, cost: { basis: "unavailable", total: null },
+    });
+  });
+
+  it("does not turn a recorded 1.5.16 occupancy frame into free spend", () => {
+    const bridge = createEventBridge(fakeStream() as any, model);
+    bridge.handleUpdate(recording.frames[0].params!.update);
+    bridge.pushToolCall({ id: "first", name: "read", arguments: {} });
+    expect(bridge.getOutput().usage).toMatchObject({
+      input: null, output: null, totalTokens: recording.frames[0].params!.update.used,
+      availability: "unavailable", cost: { total: null },
     });
   });
 
@@ -168,6 +175,7 @@ describe("createEventBridge", () => {
       totalTokens: 31_882,
     });
     expect(usage.cost.total).toBeCloseTo((7061 * 2 + 247 * 10 + 87891 * 0.1) / 1e6, 14);
+    expect(usage.cost).toMatchObject({ basis: "API-equivalent", totalFromProvider: false });
   });
 
   it("does not invent a price for unlisted models", () => {
@@ -177,6 +185,6 @@ describe("createEventBridge", () => {
     });
     bridge.applyResult(terminal);
     expect(bridge.getOutput().usage.totalTokens).toBe(95_199);
-    expect(bridge.getOutput().usage.cost.total).toBe(0);
+    expect(bridge.getOutput().usage.cost).toMatchObject({ basis: "unavailable", total: null });
   });
 });

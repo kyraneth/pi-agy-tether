@@ -28,6 +28,7 @@ import {
   newMarker,
   proofKey,
   writeAgentRecipe,
+  type NativeTool,
 } from "./agent-recipe.js";
 import { agentProofPath, appDataDir, sessionDir } from "./data-dir.js";
 import {
@@ -46,6 +47,9 @@ import {
 } from "./handoff-broker.js";
 import { linkHostLogin } from "./login.js";
 import { assertImageSupport } from "./cli-catalog.js";
+import { PromptUsage } from "./prompt-usage.js";
+import { watchAgyMemory } from "./agy-memory.js";
+import { acpUsage } from "./event-bridge.js";
 import { rememberOfferedFamilies } from "./model-discovery.js";
 import { recordStatus } from "./cli-status.js";
 import {
@@ -54,6 +58,7 @@ import {
   preparePrivateConfig,
   registerProcess,
   spawnAgy,
+  stopProcess,
 } from "./process-manager.js";
 import {
   configureSession,
@@ -62,6 +67,7 @@ import {
   type ConfigOption,
 } from "./thinking-config.js";
 import type { PromptBlock } from "./pi-context.js";
+import { watchNativeSearch, type NativeSearchSurface } from "./native-search.js";
 import { assertHistoricalReplayFits, assertWithinTurnLimit, planTurns, type TurnAssembly } from "./turn-budget.js";
 
 function modelLabel(options: readonly ConfigOption[] | undefined): string {
@@ -110,6 +116,14 @@ export interface OpenInput {
   signal?: AbortSignal;
   /** Cold Pi history, checked against the live build before recipe proof. */
   replayMessages?: readonly any[];
+  nativeTool?: NativeTool;
+  onNativeSearch?: NativeSearchSurface["record"];
+  /** Authorize exact arguments for this native call when ACP asks. */
+  allowNativeArgs?: (update: unknown) => boolean;
+  /** Recognize a native tool's terminal failure during the marker turn. */
+  preflightProblem?: (text: string) => string | undefined;
+  /** An event that occurred between Pi provider episodes, not a session notice. */
+  onProcessEvent?: (message: string) => void;
 }
 
 const lifecycle = createLifecycleRevision();
@@ -148,7 +162,9 @@ export class CliProcess {
   turnActive = false;
   exitCode: number | null = null;
   exitSignal: NodeJS.Signals | null = null;
+  memoryRetirement?: string;
 
+  private retirement?: Promise<void>;
   private sink: EpisodeSink | undefined;
   private promptInFlight = false;
   private stagedCapture: { text: string; fail: (message: string) => void } | undefined;
@@ -157,6 +173,7 @@ export class CliProcess {
   private pending = new Map<string, HandoffInvocation>();
   private retiredReasons: string[] = [];
   private readonly getStderr: () => string;
+  readonly describeKill: (signal: NodeJS.Signals) => string;
 
   private constructor(
     readonly proc: ChildProcess,
@@ -175,6 +192,7 @@ export class CliProcess {
       toolsPath: string;
       logFile: string;
       getStderr: () => string;
+      describeKill: (signal: NodeJS.Signals) => string;
     },
   ) {
     this.sessionKey = init.sessionKey;
@@ -184,6 +202,7 @@ export class CliProcess {
     this.toolsPath = init.toolsPath;
     this.logFile = init.logFile;
     this.getStderr = init.getStderr;
+    this.describeKill = init.describeKill;
     this.signature = input.signature;
     this.modelId = input.modelId;
   }
@@ -217,7 +236,7 @@ export class CliProcess {
         }) : undefined;
         const ownedRecipe = recipe = writeAgentRecipe({
           sessionKey, marker, systemPrompt: input.systemPrompt, mcpServer: server,
-          mcpToolNames: input.tools.map(({ name }) => name),
+          mcpToolNames: input.tools.map(({ name }) => name), nativeTool: input.nativeTool,
         });
         if (process.env.PI_AGY_TETHER_DUMP) {
           try {
@@ -252,10 +271,24 @@ export class CliProcess {
 
     let phase: "open" | "ready" = "open";
     let preflightText = "";
+    const preflightProblem = input.preflightProblem ?? gatewayRefusalProblem;
     let cancelTarget: string | undefined;
+    const observeSearch = input.nativeTool === "search_web" && input.onNativeSearch
+      ? watchNativeSearch(input.onNativeSearch) : undefined;
     let instance: CliProcess | undefined;
+    let guardMessage: string | undefined;
+    const memory = watchAgyMemory(proc, reason => {
+      guardMessage = `agy memory guard retired the process: ${reason}. The next request starts a new agy and replays Pi history; no prompt or tool was retried.`;
+      if (instance) instance.guardMemory(guardMessage);
+      else {
+        client.dispose(guardMessage);
+        forceKillProcess(proc);
+      }
+    });
     const client = new AcpClient(proc, {
-      onUpdate(update) {
+      onUpdate(update, params) {
+        if (params?.sessionId && cancelTarget && params.sessionId !== cancelTarget) return;
+        if (cancelTarget && !instance?.retired) observeSearch?.(update, cancelTarget);
         if (phase === "open") {
           if (
             update?.sessionUpdate === "agent_message_chunk" &&
@@ -265,7 +298,7 @@ export class CliProcess {
             // agy retries a gateway refusal for minutes with backoff. The
             // refusal is already visible in the stream, so stop waiting for a
             // marker that will never arrive instead of holding Pi's turn open.
-            if (cancelTarget && gatewayRefusalProblem(preflightText))
+            if (cancelTarget && preflightProblem(preflightText))
               client.notify("session/cancel", { sessionId: cancelTarget });
           }
           return;
@@ -282,12 +315,12 @@ export class CliProcess {
         else if (process.env.PI_AGY_TETHER_DEBUG === "1")
           console.error(`[pi-agy-tether] ${message}`);
       },
-    });
+    }, memory.describeKill);
 
     const disposeOnFailure = async (error: unknown): Promise<never> => {
       client.dispose();
-      forceKillProcess(proc);
-      const detail = error instanceof Error ? error.message : String(error);
+      await stopProcess(proc);
+      const detail = guardMessage ?? (error instanceof Error ? error.message : String(error));
       const stderr = getStderr();
       throw new Error(stderr ? `${detail}: ${stderr}` : detail);
     };
@@ -302,7 +335,7 @@ export class CliProcess {
       const agentVersion = typeof reportedVersion === "string" ? reportedVersion : "unknown";
       if (input.replayMessages)
         assertHistoricalReplayFits(input.replayMessages, { appDataDirPath: appDataDir() }, agentVersion);
-      const key = proofKey(agentVersion, input.modelId);
+      const key = proofKey(agentVersion, input.modelId, input.nativeTool);
       const proofPath = key ? agentProofPath(key) : undefined;
 
       const opened = await client.request("session/new", {
@@ -342,7 +375,7 @@ export class CliProcess {
             assemblyFor(path, lastPromptLabel, label), agentVersion, input.modelId);
           lastPromptLabel = label;
           checkFallback(logFile, proofPath);
-          const problem = gatewayRefusalProblem(preflightText) ?? markerProblem(preflightText, marker);
+          const problem = preflightProblem(preflightText) ?? markerProblem(preflightText, marker);
           if (problem) throw new Error(problem);
           if (preflight?.stopReason === "cancelled")
             throw new Error("agy cancelled the agent marker turn");
@@ -369,7 +402,7 @@ export class CliProcess {
       // Check the linked credential by metadata only before exposing the session.
       if (verifyLogin) await verifyLogin();
       input.signal?.throwIfAborted();
-      if (proc.signalCode) throw new Error(`agy was killed (signal ${proc.signalCode})`);
+      if (proc.signalCode) throw new Error(memory.describeKill(proc.signalCode));
       if (proc.exitCode !== null) throw new Error("agy exited during session setup");
       instance = new CliProcess(proc, client, input, ownedRecipe.preface, proofPath, path, modelLabel(options), lastPromptLabel, {
         sessionKey,
@@ -379,6 +412,7 @@ export class CliProcess {
         toolsPath,
         logFile,
         getStderr,
+        describeKill: memory.describeKill,
       });
       instance.sessionId = sessionId;
       phase = "ready";
@@ -427,6 +461,16 @@ export class CliProcess {
     else this.sink?.onFatal(message);
   }
 
+  private guardMemory(message: string): void {
+    if (!this.alive) return;
+    this.memoryRetirement = message;
+    const awaitingPiTool = this.hasPendingHandoffs;
+    void this.retire(["memory_guard"]);
+    if (this.sink || this.stagedCapture) this.fatal(message);
+    else this.input.onProcessEvent?.(awaitingPiTool
+      ? `${message} In-flight tool results cannot resume their blocked call.` : message);
+  }
+
   private handleExit(code: number | null, signal: NodeJS.Signals | null = null): void {
     this.exitCode = code;
     this.exitSignal = signal;
@@ -439,7 +483,8 @@ export class CliProcess {
         isError: true,
       });
     this.pending.clear();
-    this.sink?.onClose(code, signal);
+    if (this.sink) this.sink.onClose(code, signal);
+    else if (signal && !this.stagedCapture) this.input.onProcessEvent?.(this.describeKill(signal));
   }
 
   /**
@@ -451,7 +496,9 @@ export class CliProcess {
     const name = params?.toolCall?.name;
     const allowed = !this.retired && !this.stagedCapture && this.promptInFlight &&
       params?.sessionId === this.sessionId &&
-      this.input.tools.some(tool => name === `mcp_${MCP_SERVER_NAME}_${tool.name}`);
+      ((this.input.nativeTool !== undefined && name === this.input.nativeTool &&
+        this.input.allowNativeArgs?.(params.toolCall) === true) ||
+        this.input.tools.some(tool => name === `mcp_${MCP_SERVER_NAME}_${tool.name}`));
     return { outcome: allowed ? "allowed" : "denied" };
   }
 
@@ -573,8 +620,22 @@ export class CliProcess {
     }
   }
 
+  private promptUsage?: PromptUsage;
+
+  handoffUsage(contextTokens?: number) {
+    return this.promptUsage?.handoff(contextTokens) ?? acpUsage(undefined);
+  }
+
+  terminalUsage(usage: AcpPromptResult["usage"], contextTokens?: number) {
+    const counts = this.promptUsage?.terminal(usage, contextTokens) ?? acpUsage(usage);
+    this.promptUsage = undefined;
+    return counts;
+  }
+
   /** Send the final prompt; results and updates route to the attached episode. */
   sendPrompt(blocks: PromptBlock[]): void {
+    // Baseline after marker and staging: never charge their steps to Pi turns.
+    this.promptUsage = PromptUsage.begin(this.appDataDirPath, this.sessionId, this.agentVersion);
     void this.startPrompt(blocks)
       .then((result) => {
         if (this.retired) return;
@@ -599,7 +660,7 @@ export class CliProcess {
   }
 
   async retire(reasons: string[] = []): Promise<void> {
-    if (this.retired) return;
+    if (this.retired) return this.retirement;
     this.retired = true;
     this.retiredReasons = reasons;
     recordStatus({ lastRetirement: reasons });
@@ -617,7 +678,9 @@ export class CliProcess {
       });
     this.pending.clear();
     this.client.dispose("agy tether session retired");
-    forceKillProcess(this.proc);
+    if (this.exitCode === null && this.exitSignal === null)
+      this.retirement = stopProcess(this.proc);
+    return this.retirement;
   }
 
   retirementReasons(): string[] {

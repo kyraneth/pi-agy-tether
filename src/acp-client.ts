@@ -47,6 +47,7 @@ export class AcpClient {
   constructor(
     readonly proc: ChildProcess,
     private readonly handlers: AcpHandlers,
+    private readonly describeKill = (signal: NodeJS.Signals) => `agy was killed (signal ${signal})`,
   ) {
     this.rl = createInterface({ input: proc.stdout! });
     this.rl.on("line", (line) => this.onLine(line));
@@ -56,7 +57,7 @@ export class AcpClient {
     // A process that dies mid-request must reject every waiter, not hang them.
     proc.once("exit", (code, signal) =>
       this.dispose(
-        signal ? `agy was killed (signal ${signal})` : `agy acp exited (${code ?? "unknown"}) before answering`,
+        signal ? this.describeKill(signal) : `agy acp exited (${code ?? "unknown"}) before answering`,
       ),
     );
     proc.once("error", (error) => this.dispose(`agy acp failed: ${error.message}`));

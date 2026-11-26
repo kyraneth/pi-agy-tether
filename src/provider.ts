@@ -28,11 +28,15 @@ import {
 } from "./cli-process.js";
 import { assertImageSupport } from "./cli-catalog.js";
 import { splitRefusedPrompt } from "./agent-recipe.js";
-import { createEventBridge, PROVIDER_ID } from "./event-bridge.js";
+import { createEventBridge, PROVIDER_ID, unavailableUsage } from "./event-bridge.js";
 import type { ToolDefinition } from "./mcp-config.js";
 import type { HandoffResult } from "./handoff-broker.js";
-import { resultLossNotices, strictTransport, transportNotice, type ResultLossNotice } from "./degradations.js";
+import {
+  EMPTY_CATALOG_FACT, GENERATION_CONTROLS_FACT, RESULT_FRAMING_FACT, TOOL_CATALOG_FACT,
+  logTransportFact, resultLossNotices, strictTransport, transportNotice, type ResultLossNotice,
+} from "./degradations.js";
 import { TurnLimitError, type TurnPlan } from "./turn-budget.js";
+import { allowSearchArgs, nativeSearchEnabled, type NativeSearchSurface } from "./native-search.js";
 
 /** Extended stream options: Pi's SimpleStreamOptions plus host plumbing. */
 export type StreamViaAcpOptions = SimpleStreamOptions & {
@@ -41,6 +45,9 @@ export type StreamViaAcpOptions = SimpleStreamOptions & {
   notify?: (message: string) => void;
   /** Record every result disclosure in Pi’s journal, including suppressed repeats. */
   recordResultNotice?: (notice: ResultLossNotice) => void;
+  /** Journal-only diagnostic; never a screen notification. */
+  recordUsageUnavailable?: () => void;
+  search?: NativeSearchSurface;
   /**
    * Build the Pi tool surface from the effective (post-hook) request. The
    * provider calls this after `onPayload` so a replacement tool set is what agy
@@ -86,8 +93,9 @@ function isUnsentPiFailure(message: any): boolean {
     Array.isArray(message.content) &&
     message.content.length === 0 &&
     !!message.usage &&
-    ["input", "output", "cacheRead", "cacheWrite", "totalTokens"].every(
-      (k) => message.usage[k] === 0,
+    message.usage.totalTokens === 0 &&
+    ["input", "output", "cacheRead", "cacheWrite"].every(
+      (k) => message.usage[k] === 0 || message.usage[k] === null,
     )
   );
 }
@@ -130,7 +138,7 @@ export function toHandoffResult(msg: any, modelId: string): HandoffResult {
 }
 
 /** What a parked connection was asked for; a mismatch retires it. */
-const SIGNATURE_FIELDS = ["model", "systemPrompt", "cwd", "handoffSocket", "tools"] as const;
+const SIGNATURE_FIELDS = ["model", "systemPrompt", "cwd", "handoffSocket", "tools", "nativeTool"] as const;
 
 function retireReasons(r: {
   stale: boolean;
@@ -165,14 +173,7 @@ function emptyMessage(model: Model<any>): any {
     api: PROVIDER_ID,
     provider: model.provider,
     model: model.id,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
+    usage: unavailableUsage(),
     stopReason: "stop",
   };
 }
@@ -213,18 +214,23 @@ export function streamViaAcp(
   }
 
   async function runOnce(): Promise<void> {
+    const nativeSearch = nativeSearchEnabled();
+    if (strict && nativeSearch) await refuseBeforePrompt(
+      "PI_AGY_TETHER_STRICT refuses agy native search. Unset PI_AGY_TETHER_NATIVE_SEARCH; no prompt was sent.",
+      "strict_native_search",
+    );
     // Model defaults live on the model. An explicit zero is still a control.
     const controls = ["temperature", "maxTokens", "toolChoice"] as const;
     const explicit = controls.filter(key => options?.[key] !== undefined);
+    if (!strict) logTransportFact(GENERATION_CONTROLS_FACT);
     if (explicit.length) {
       const names = explicit.join(", ");
       if (strict) await refuseBeforePrompt(
         `agy cannot honor explicit generation controls: ${names}. No prompt was sent for this request. Remove the controls or use a provider that honors them.`,
         "unsupported_generation_controls",
       );
-      const others = controls.filter(key => !explicit.includes(key));
-      notice(`agy ignored explicit generation controls: ${names}.` +
-        (others.length ? ` Also unsupported if set: ${others.join(", ")}.` : ""), "generation-controls");
+      // Only fields supplied in this request change the user's result.
+      notice(`agy ignored explicit generation controls: ${names}.`, "generation-controls");
     }
     let prepared = normalizePiContext(context);
 
@@ -259,9 +265,9 @@ export function streamViaAcp(
         `agy cannot preserve the Pi system role without the gateway workaround: ${detail}. No prompt was sent. Use a provider that can preserve the system instruction.`,
         "system_role_changed",
       );
-      notice(preface.length
+      logTransportFact(preface.length
         ? `agy moved Pi system lines to the first user prompt: ${detail}.`
-        : `agy changed the Pi system prompt: ${detail}.`, "system-role");
+        : `agy changed the Pi system prompt: ${detail}.`);
     }
 
     const cwd = options?.cwd ?? process.cwd();
@@ -285,14 +291,21 @@ export function streamViaAcp(
       cwd,
       handoffSocket ?? null,
       JSON.stringify(tools),
+      ...(nativeSearch ? ["search_web"] : []),
     ]);
 
     // ---- 1. Reuse the session's parked connection when this call continues it
     let mode: "spawn" | "turn" | "handoff" = "spawn";
     let cli = piSessionId ? takeParkedCliProcess(piSessionId) : undefined;
+    const guardRestart = !!cli?.memoryRetirement;
+    if (cli?.memoryRetirement) {
+      await cli.retire(["memory_guard"]);
+      cli = undefined;
+    }
     if (cli) {
       if (!cli.alive && delta.some(m => m?.role === "toolResult")) {
-        const detail = cli.exitSignal ? `agy was killed (signal ${cli.exitSignal})` : "agy exited before answering";
+        // The parked child already reported its own signal event on screen.
+        const detail = "agy exited before answering";
         await cli.retire(["exit_during_handoff"]);
         throw new Error(`${detail}. Pi retained the tool results; no tools were retried.`);
       }
@@ -325,21 +338,20 @@ export function streamViaAcp(
     }
 
     if (mode !== "handoff") {
-      const constraint = prepared.tools?.length
-        ? "agy cannot verify the exact Pi tool catalog; it can omit or rewrite Pi declarations and add native tools."
-        : "agy cannot verify an empty tool catalog; native tools may still be offered.";
+      const constraint = prepared.tools?.length ? TOOL_CATALOG_FACT : EMPTY_CATALOG_FACT;
       if (strict) {
         if (cli && piSessionId) parkCliProcess(piSessionId, cli, "unverified_tool_catalog");
         throw new Error(`${constraint} No prompt was sent. Use a provider with an exact tool catalog.`);
       }
-      notice(constraint, "tool-catalog");
+      logTransportFact(constraint);
     }
 
     // Without the blocked call, replay would be history text, not a tool response.
     const unboundResults = mode !== "handoff" && delta.some(m => m?.role === "toolResult");
     if (unboundResults) {
       if (strict) throw new Error("agy cannot verify intact tool-result delivery without the matching blocked call. Pi retained the results; no tools were retried.");
-      notice("agy lost the matching blocked call; returning Pi tool results as history text, not native tool responses. Pi retained the results.");
+      if (!guardRestart)
+        notice("agy lost the matching blocked call; returning Pi tool results as history text, not native tool responses. Pi retained the results.");
     }
 
     // Reject known text-only input before a recipe proof or warm config readback.
@@ -360,6 +372,7 @@ export function streamViaAcp(
         return;
       }
       debug("opening");
+      if (nativeSearch) options?.search?.announce();
       cli = await CliProcess.open({
         cwd,
         modelId: model.id,
@@ -370,7 +383,9 @@ export function streamViaAcp(
         signature,
         handoffSocket: handoffSocket!,
         signal: options?.signal,
+        onProcessEvent: (message) => notice(message),
         replayMessages: messages,
+        ...(nativeSearch ? { nativeTool: "search_web", allowNativeArgs: allowSearchArgs, onNativeSearch: options?.search?.record } : {}),
       });
       if (invalidated() || options?.signal?.aborted) {
         await cli.retire(["abort"]);
@@ -419,11 +434,13 @@ export function streamViaAcp(
     let finished = false;
     let aborted = false;
     let resolveFinished!: () => void;
+    let abortHandler: (() => void) | undefined;
     const finishedPromise = new Promise<void>((r) => (resolveFinished = r));
 
     function finishEpisode() {
       if (finished) return;
       finished = true;
+      if (abortHandler) options?.signal?.removeEventListener("abort", abortHandler);
       live.detach();
       resolveFinished();
     }
@@ -437,6 +454,7 @@ export function streamViaAcp(
       bridge.finalizeBlocks();
       const output = bridge.getOutput();
       if (!streamEnded) {
+        if (output.usage.input === null) options?.recordUsageUnavailable?.();
         streamEnded = true;
         endStreamWithError(
           stream,
@@ -457,7 +475,9 @@ export function streamViaAcp(
     function endWithDone(reason: any) {
       if (finished) return;
       streamEnded = true;
-      stream.push({ type: "done", reason, message: { ...bridge.getOutput(), stopReason: reason } });
+      const output = bridge.getOutput();
+      if (output.usage.input === null) options?.recordUsageUnavailable?.();
+      stream.push({ type: "done", reason, message: { ...output, stopReason: reason } });
       stream.end();
       finishEpisode();
       if (piSessionId) parkCliProcess(piSessionId, live, "idle");
@@ -472,7 +492,7 @@ export function streamViaAcp(
       onPromptResult(result) {
         if (finished) return;
         debug("prompt result", result);
-        bridge.applyResult(result);
+        bridge.applyResult(result, live.terminalUsage(result.usage, bridge.contextTokens()));
         bridge.finalizeBlocks();
         const output = bridge.getOutput();
         if (output.stopReason === "toolUse") output.stopReason = "stop";
@@ -492,6 +512,7 @@ export function streamViaAcp(
           });
           return;
         }
+        bridge.applyUsage(live.handoffUsage(bridge.contextTokens()));
         bridge.pushToolCall({
           id: invocation.piCallId,
           name: invocation.name,
@@ -508,7 +529,7 @@ export function streamViaAcp(
         if (finished) return;
         const stderr = live.stderr();
         const message = signal
-          ? `agy was killed (signal ${signal})`
+          ? live.describeKill(signal)
           : stderr
             ? `agy acp exited with code ${code}: ${stderr}`
             : `agy acp exited unexpectedly with code ${code}`;
@@ -516,6 +537,7 @@ export function streamViaAcp(
       },
       onFatal(message) {
         if (finished) return;
+        if (live.memoryRetirement && piSessionId) parkCliProcess(piSessionId, live, "memory_guard");
         endWithError(message, aborted ? "aborted" : "error", ["episode_error"]);
       },
     };
@@ -537,11 +559,12 @@ export function streamViaAcp(
         await live.retire(["handoff_result_refused"]);
         throw error;
       }
-      notice("agy adds Created At and Completed At timestamps to Pi tool results.", "result-framing");
+      logTransportFact(RESULT_FRAMING_FACT);
       for (const { tool, result } of results) {
         for (const loss of resultLossNotices(live.agentVersion, tool, result)) {
           options?.recordResultNotice?.(loss);
-          notice(loss.message, loss.once);
+          if (loss.surface === "screen") notice(loss.message);
+          else logTransportFact(loss.message);
         }
       }
       const deliveries = results.map(({ id, result }) => live.deliverHandoffResult(id, result));
@@ -566,24 +589,14 @@ export function streamViaAcp(
     }
 
     if (options?.signal) {
-      options.signal.addEventListener(
-        "abort",
-        () => {
-          if (finished) return;
-          aborted = true;
-          live.cancel();
-          void live.retire(["abort"]);
-          endWithError("Request aborted", "aborted", ["abort"]);
-        },
-        { once: true },
-      );
-      if (options.signal.aborted) {
+      abortHandler = () => {
+        if (finished) return;
         aborted = true;
         live.cancel();
-        void live.retire(["abort"]);
         endWithError("Request aborted", "aborted", ["abort"]);
-        return;
-      }
+      };
+      options.signal.addEventListener("abort", abortHandler, { once: true });
+      if (options.signal.aborted) { abortHandler(); return; }
     }
 
     await finishedPromise;

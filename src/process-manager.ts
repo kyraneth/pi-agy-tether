@@ -173,15 +173,22 @@ export function captureStderr(proc: ChildProcess): () => string {
   return () => buffer.trim();
 }
 
+const stopping = new WeakSet<ChildProcess>();
+
 export function forceKillProcess(proc: ChildProcess | undefined): void {
-  if (!proc || proc.killed || proc.exitCode !== null) return;
-  try {
-    proc.kill("SIGTERM");
-  } catch {
-    /* already gone */
+  if (!proc || proc.exitCode !== null || proc.signalCode || stopping.has(proc)) return;
+  stopping.add(proc);
+  // `killed` means a signal was sent (including by spawn's AbortSignal),
+  // not that agy exited. The existing escalation still has to be armed.
+  if (!proc.killed) {
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
   }
   const timer = setTimeout(() => {
-    if (proc.exitCode !== null) return;
+    if (proc.exitCode !== null || proc.signalCode) return;
     try {
       proc.kill("SIGKILL");
     } catch {
@@ -196,13 +203,14 @@ export function registerProcess(proc: ChildProcess): void {
   liveProcesses.add(proc);
   proc.once("exit", () => liveProcesses.delete(proc));
 }
+export async function stopProcess(proc: ChildProcess): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode) return;
+  // Observe exit before spawning a replacement or removing the runtime dir.
+  const exited = proc.pid ? new Promise<void>(resolve => proc.once("exit", () => resolve())) : undefined;
+  forceKillProcess(proc);
+  await exited;
+}
+
 export async function killAllProcesses(): Promise<void> {
-  await Promise.all([...liveProcesses].map((proc) => {
-    if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) return;
-    // agy can still write its private state after accepting SIGTERM. Observe
-    // exit before allowing normal shutdown to remove the runtime directory.
-    const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
-    forceKillProcess(proc);
-    return exited;
-  }));
+  await Promise.all([...liveProcesses].map(stopProcess));
 }

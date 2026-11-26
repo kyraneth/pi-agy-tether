@@ -1,7 +1,19 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { expect, it } from "vitest";
-import { killAllProcesses, registerProcess } from "../src/process-manager.js";
+import { expect, it, vi } from "vitest";
+import { forceKillProcess, killAllProcesses, registerProcess } from "../src/process-manager.js";
+
+it("escalates an abort whose SIGTERM was sent but did not stop the process", () => {
+  vi.useFakeTimers();
+  try {
+    const kill = vi.fn();
+    const proc = { killed: true, exitCode: null, signalCode: null, kill } as unknown as ChildProcess;
+    forceKillProcess(proc);
+    forceKillProcess(proc);
+    vi.runAllTimers();
+    expect(kill.mock.calls).toEqual([["SIGKILL"]]);
+  } finally { vi.useRealTimers(); }
+});
 
 it("waits for vendor shutdown before allowing runtime cleanup", async () => {
   const child = spawn(process.execPath, ["-e", `

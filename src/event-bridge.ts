@@ -40,8 +40,11 @@ export interface EventBridge {
     name: string;
     arguments: Record<string, unknown>;
   }): void;
-  /** Apply the prompt terminal: usage, stop reason, final text safety net. */
-  applyResult(result: AcpPromptResult): void;
+  /** ACP occupancy, never spend. */
+  contextTokens(): number | undefined;
+  applyUsage(counts: ReturnType<typeof acpUsage>): void;
+  /** Apply the prompt terminal, net of earlier Pi handoff usage. */
+  applyResult(result: AcpPromptResult, counts?: ReturnType<typeof acpUsage>): void;
   /** Append a provider diagnostic as a text block (used for exit detail). */
   appendMarker(text: string): void;
   /** Close any open text/thinking block before `toolcall_end` or `done`. */
@@ -82,7 +85,8 @@ export function acpUsage(u: AcpPromptResult["usage"]): {
     cacheWrite: writes,
     reasoning,
     totalTokens: total,
-    present: !!u && Object.values(u).some((value) => finite(value)),
+    present: finite(u?.inputTokens) && finite(u?.outputTokens) &&
+      input + completion + cache + reasoning > 0,
   };
 }
 
@@ -97,6 +101,20 @@ export function mapStopReason(reason: string | undefined): "stop" | "length" | "
     default:
       return "stop";
   }
+}
+
+const UNAVAILABLE_COST = {
+  input: null, output: null, cacheRead: null, cacheWrite: null, total: null, basis: "unavailable",
+} as const;
+
+// Pi 1.5/1.6 require number slots but have no unknown sentinel. Null retains an
+// explicit unknown in JSON and does not poison Pi's numeric sums like NaN would.
+// Keep the shape (including cost) and leave positive occupancy in totalTokens.
+export function unavailableUsage(): AssistantMessage["usage"] {
+  return {
+    input: null, output: null, cacheRead: null, cacheWrite: null, totalTokens: 0,
+    availability: "unavailable", cost: { ...UNAVAILABLE_COST },
+  } as unknown as AssistantMessage["usage"];
 }
 
 export function createEventBridge(
@@ -114,14 +132,7 @@ export function createEventBridge(
     api: PROVIDER_ID as any,
     provider: model.provider,
     model: model.id,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
+    usage: unavailableUsage(),
     stopReason: "stop",
     timestamp: Date.now(),
   };
@@ -225,7 +236,8 @@ export function createEventBridge(
         // tool_call and before the prompt terminal. Record it so toolUse turns
         // carry real per-step context tokens and the final assistant message
         // reports the last step's context rather than the multi-step sum.
-        // The terminal alone supplies the cumulative priced token counters.
+        // It carries no spend counters on 1.5.16; the live prompt owner
+        // separately attributes the spend at each Pi episode boundary.
         if (finite(update.used) && update.used > 0) {
           lastStepUsed = update.used;
           output.usage.totalTokens = update.used;
@@ -259,18 +271,21 @@ export function createEventBridge(
     output.stopReason = "toolUse";
   }
 
-  function applyResult(result: AcpPromptResult): void {
-    start();
-    const usage = acpUsage(result.usage);
-    if (usage.present) {
-      output.usage.input = usage.input;
-      output.usage.output = usage.output;
-      output.usage.cacheRead = usage.cacheRead;
-      output.usage.cacheWrite = usage.cacheWrite;
-      output.usage.reasoning = usage.reasoning;
-      output.usage.totalTokens = lastStepUsed ?? usage.totalTokens;
-      if (model.cost) calculateCost(model, output.usage);
+  function applyUsage(counts: ReturnType<typeof acpUsage>): void {
+    if (!counts.present) return;
+    const { present: _, ...usage } = counts;
+    Object.assign(output.usage, usage, {
+      totalTokens: lastStepUsed ?? counts.totalTokens, availability: "reported",
+    });
+    if (model.cost && Object.values(model.cost).some(rate => typeof rate === "number" && rate > 0)) {
+      calculateCost(model, output.usage);
+      Object.assign(output.usage.cost, { basis: "API-equivalent" });
     }
+  }
+
+  function applyResult(result: AcpPromptResult, counts = acpUsage(result.usage)): void {
+    start();
+    applyUsage(counts);
     const mapped = mapStopReason(result.stopReason);
     // A handoff already claimed this episode: the turn continues in Pi.
     if (output.stopReason !== "toolUse") output.stopReason = mapped;
@@ -283,7 +298,9 @@ export function createEventBridge(
 
   return {
     handleUpdate,
+    contextTokens: () => lastStepUsed,
     pushToolCall,
+    applyUsage,
     applyResult,
     appendMarker,
     finalizeBlocks: closeBlocks,
