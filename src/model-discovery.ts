@@ -28,7 +28,7 @@ import {
   type AgyFamily,
   type OfferedFamily,
 } from "./cli-catalog.js";
-import { catalogCachePath } from "./data-dir.js";
+import { catalogCachePath, privateWorkspace } from "./data-dir.js";
 import { linkHostLogin } from "./login.js";
 import {
   forceKillProcess,
@@ -100,7 +100,8 @@ export async function probeStartup(catalog: boolean): Promise<{ families: AgyFam
   try {
     // Only session/new needs authentication. Initialize is local.
     if (catalog) await linkHostLogin();
-    proc = spawnAcpProbe();
+    const cwd = privateWorkspace("catalog");
+    proc = spawnAcpProbe(cwd);
     registerProcess(proc);
     client = new AcpClient(proc, {
       onUpdate() {},
@@ -114,7 +115,7 @@ export async function probeStartup(catalog: boolean): Promise<{ families: AgyFam
     });
     image = initialized?.agentCapabilities?.promptCapabilities?.image === true;
     const opened = catalog
-      ? await client.request("session/new", { cwd: process.cwd(), mcpServers: [] })
+      ? await client.request("session/new", { cwd, mcpServers: [] })
       : undefined;
     return { image, families: opened ? familiesFromSessionNew(opened) : [] };
   } catch {

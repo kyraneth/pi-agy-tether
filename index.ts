@@ -14,6 +14,7 @@ import { agyModels, setAgyCatalog } from "./src/cli-catalog.js";
 import { probeStartup, startupCatalog } from "./src/model-discovery.js";
 import { cliStatusLine, recordStatus } from "./src/cli-status.js";
 import { killAllProcesses, validateCliPresence } from "./src/process-manager.js";
+import { memoryGuardDoctor } from "./src/agy-memory.js";
 import { startHandoffBroker, stopHandoffBroker } from "./src/handoff-broker.js";
 import { cleanupRuntimeDir } from "./src/runtime-dir.js";
 import { retireAllCliProcesses } from "./src/cli-process.js";
@@ -95,9 +96,9 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agy-doctor", {
-    description: "Show persistent agy transport limitations and the diagnostic log path",
+    description: "Show agy transport, memory guard and diagnostic log settings",
     handler: async (_args, ctx) => {
-      ctx.ui.notify(transportDoctor(), "info");
+      ctx.ui.notify(`${transportDoctor()}\n${memoryGuardDoctor()}`, "info");
     },
   });
 

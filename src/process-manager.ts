@@ -155,8 +155,9 @@ function acpArgs(): string[] {
  * session. Used to ask the build what it advertises before Pi registers models
  * (src/prompt-capabilities.ts).
  */
-export function spawnAcpProbe(): ChildProcess {
+export function spawnAcpProbe(cwd: string): ChildProcess {
   return spawn(resolveCli(), acpArgs(), {
+    cwd,
     env: cliEnvironment(),
     stdio: ["pipe", "pipe", "pipe"],
   });

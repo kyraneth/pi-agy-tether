@@ -374,7 +374,6 @@ export function streamViaAcp(
       debug("opening");
       if (nativeSearch) options?.search?.announce();
       cli = await CliProcess.open({
-        cwd,
         modelId: model.id,
         thinkingLevel: options?.reasoning,
         oneShot: tools.length === 0 && options?.cacheRetention === "none",

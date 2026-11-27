@@ -30,7 +30,7 @@ import {
   writeAgentRecipe,
   type NativeTool,
 } from "./agent-recipe.js";
-import { agentProofPath, appDataDir, sessionDir } from "./data-dir.js";
+import { agentProofPath, appDataDir, privateWorkspace, sessionDir } from "./data-dir.js";
 import {
   MCP_SERVER_NAME,
   removeSessionFiles,
@@ -102,7 +102,8 @@ export interface EpisodeSink {
 }
 
 export interface OpenInput {
-  cwd: string;
+  /** Private workspace for native image input/output; ordinary tools run in Pi. */
+  imageWorkspace?: string;
   modelId: string;
   /** Pi's requested thinking level (`off`/`minimal` mean "no specific level"). */
   thinkingLevel?: string;
@@ -253,10 +254,12 @@ export class CliProcess {
       }
     })();
     let proc: ChildProcess;
+    let cwd: string;
     try {
       input.signal?.throwIfAborted();
+      cwd = input.imageWorkspace ?? privateWorkspace(sessionKey);
       proc = spawnAgy({
-        cwd: input.cwd, sessionId: sessionKey, logFile, signal: input.signal,
+        cwd, sessionId: sessionKey, logFile, signal: input.signal,
         agentName: ownedRecipe.name,
       });
     } catch (error) {
@@ -278,7 +281,7 @@ export class CliProcess {
     let instance: CliProcess | undefined;
     let guardMessage: string | undefined;
     const memory = watchAgyMemory(proc, reason => {
-      guardMessage = `agy memory guard retired the process: ${reason}. The next request starts a new agy and replays Pi history; no prompt or tool was retried.`;
+      guardMessage = `agy memory guard retired the process: ${reason}. Termination uses SIGTERM (SIGKILL if needed). The next request starts a new agy and replays Pi history; no prompt or tool was retried.`;
       if (instance) instance.guardMemory(guardMessage);
       else {
         client.dispose(guardMessage);
@@ -339,7 +342,7 @@ export class CliProcess {
       const proofPath = key ? agentProofPath(key) : undefined;
 
       const opened = await client.request("session/new", {
-        cwd: input.cwd,
+        cwd,
         mcpServers: server ? [server] : [],
         // Request suppression; ACP does not attest to the generated catalog.
         disableBuiltInTools: true,

@@ -119,7 +119,7 @@ export async function generateImage(params: ImageParams, sessionId: string, mode
         (!params.aspectRatio || input.AspectRatio === params.aspectRatio);
     };
     cli = await CliProcess.open({
-      cwd: work, modelId, tools: [], signature: "image", handoffSocket: "", signal,
+      imageWorkspace: work, modelId, tools: [], signature: "image", handoffSocket: "", signal,
       oneShot: true, nativeTool: TOOL, allowNativeArgs: argsMatch,
       preflightProblem: text => classify(text)?.message,
       systemPrompt: "You are an image-tool adapter. When given generate_image arguments, make one generate_image call using the supplied ImageName, ImagePaths and AspectRatio exactly. Do not use unlisted paths or any other tool. Do not call it again on failure. Then report briefly whether it succeeded.",

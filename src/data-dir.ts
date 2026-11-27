@@ -9,6 +9,7 @@
  * write them must never fail a turn.
  */
 
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existingRuntimeDir, runtimeDir } from "./runtime-dir.js";
@@ -50,6 +51,13 @@ function safeFileSegment(value: string): string {
 /** Per-ACP-session staging (tool schema, log) in the private runtime directory. */
 export function sessionDir(sessionId: string): string {
   return join(runtimeDir(), "sessions", safeFileSegment(sessionId));
+}
+
+/** agy crawls its workspace even with only explicit tools. Pi owns user-file access. */
+export function privateWorkspace(sessionId: string): string {
+  const path = join(sessionDir(sessionId), "workspace");
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  return path;
 }
 
 /** Existing per-session staging path without allocating a new runtime directory. */

@@ -39,7 +39,7 @@ clean=(env -i "PATH=$smoke_dir/bin:$PATH" "HOME=$smoke_dir/user-home" "TMPDIR=$s
   "XDG_CACHE_HOME=$smoke_dir/cache" "XDG_STATE_HOME=$smoke_dir/state" "XDG_RUNTIME_DIR=$smoke_dir/runtime"
   "PI_CODING_AGENT_DIR=$smoke_dir/agent" "PI_CODING_AGENT_SESSION_DIR=$smoke_dir/agent/sessions"
   "npm_config_cache=${npm_config_cache:-$smoke_dir/cache}" "PI_AGY_TETHER_CLI=$smoke_dir/bin/agy"
-  PI_OFFLINE=1 PI_TELEMETRY=0 PI_SKIP_VERSION_CHECK=1 CI=1)
+  "SMOKE_PI_WORKSPACE=$smoke_dir/cwd" PI_OFFLINE=1 PI_TELEMETRY=0 PI_SKIP_VERSION_CHECK=1 CI=1)
 
 if (( $# > 1 )); then
   printf 'Usage: %s [package.tgz]\n' "$0" >&2
@@ -55,6 +55,7 @@ name=$(tar -xOzf "$archive" package/package.json |
 node -p 'JSON.stringify({packages: [`npm:${process.argv[1]}`]})' "$name" > "$smoke_dir/agent/settings.json"
 
 cd "$smoke_dir/cwd"
+printf 'Pi workspace sentinel\n' > workspace.txt
 # Match Pi's managed npm layout and leave Pi peer dependencies to the host loader.
 "${clean[@]}" npm install --prefix "$smoke_dir/agent/npm" --omit=dev --legacy-peer-deps \
   --ignore-scripts --no-audit --no-fund "$archive"
@@ -121,5 +122,5 @@ assert.equal(custom('search', 'native-search-notice').length, 1);
 assert.doesNotMatch(read('search', 'events.jsonl'), /must not leak/);
 assert(entries('strict').some(e => e.type === 'message_end' && e.message?.stopReason === 'error' && /strict.*native search/i.test(e.message.errorMessage)));
 assert(!require('node:fs').existsSync(`${base}/strict/agent.md`));
-console.log('Installed provider, image/search opt-ins, strict refusal and no new default surfaces verified.');
+console.log('Installed provider, private ACP workspace, image/search opt-ins and strict refusal verified.');
 EOF

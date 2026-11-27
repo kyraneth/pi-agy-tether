@@ -132,7 +132,7 @@ function fakeAgy(input: Parameters<typeof spawnAgy>[0]): ReturnType<typeof spawn
 
 async function open(modelId = hydrogen, extra: Partial<Parameters<typeof CliProcess.open>[0]> = {}) {
   const cli = await CliProcess.open({
-    cwd, modelId, thinkingLevel: modelId === oss ? undefined : "high",
+    modelId, thinkingLevel: modelId === oss ? undefined : "high",
     systemPrompt: "You are an assistant running inside Pi.\nKeep this.\n<docs>\n  Read these docs verbatim.  \n</docs>",
     tools: [], signature: "fake", handoffSocket: "", ...extra,
   });

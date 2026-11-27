@@ -1,6 +1,6 @@
 {
   "name": "pi-agy-tether",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Use your Google Antigravity subscription in Pi through the official agy ACP server",
   "main": "index.ts",
   "keywords": [

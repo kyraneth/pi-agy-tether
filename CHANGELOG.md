@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+- Keep Antigravity out of Pi’s working directory so large projects no longer trigger a recursive workspace scan. Pi’s tools still use the original directory.
+- On Linux, retire Antigravity under host or cgroup memory pressure instead of applying a fixed per-process memory cutoff. Run `/agy-doctor` to see the active policy, or set `PI_AGY_TETHER_MEMORY_GUARD` to an explicit host reserve in KiB or `off`.
+- Include anonymous, file-backed, and shared memory in termination diagnostics. An unexplained kill is not reported as likely out of memory without supporting kernel evidence.
+
 ## 0.1.4
 
 - Enable `PI_AGY_TETHER_IMAGE_TOOL=1` to generate and edit images with `agy_generate_image`. Outputs stay in the Pi session’s artifact directory; reference images are staged without overwriting them.

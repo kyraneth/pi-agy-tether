@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Offline ACP fixture for the external installed-Pi loading boundary.
-const { readFileSync } = require('node:fs');
+const { readFileSync, readdirSync, realpathSync } = require('node:fs');
 const { join } = require('node:path');
+const assert = require('node:assert/strict');
 const { createInterface } = require('node:readline');
 const { randomUUID } = require('node:crypto');
 const args = process.argv.slice(2);
@@ -27,6 +28,10 @@ createInterface({ input: process.stdin }).on('line', line => {
       respond({ agentInfo: { version: '1.5.16' }, agentCapabilities: {promptCapabilities: {image: true}} });
       break;
     case 'session/new':
+      // The probe and conversation must not point agy's crawler at Pi's cwd.
+      assert.equal(realpathSync(params.cwd), process.cwd());
+      assert.notEqual(process.cwd(), process.env.SMOKE_PI_WORKSPACE);
+      assert.deepEqual(readdirSync(process.cwd()), []);
       respond({ sessionId, configOptions: opts(), models: {availableModels: [{modelId, name: 'Gemini 4 Hydrogen'}]} });
       break;
     case 'session/set_config_option':
